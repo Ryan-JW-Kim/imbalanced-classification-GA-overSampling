@@ -1,0 +1,16 @@
+{"time":"2025-05-26T23:02:21.2115984-04:00","level":"INFO","msg":"stream: starting","core version":"0.19.11","symlink path":"c:\\MY FILES\\Dev\\imbalanced-classification-GA-overSampling\\wandb\\run-20250526_230221-ktix01ni\\logs\\debug-core.log"}
+{"time":"2025-05-26T23:02:21.4155843-04:00","level":"INFO","msg":"created new stream","id":"ktix01ni"}
+{"time":"2025-05-26T23:02:21.4160965-04:00","level":"INFO","msg":"stream: started","id":"ktix01ni"}
+{"time":"2025-05-26T23:02:21.4160965-04:00","level":"INFO","msg":"writer: Do: started","stream_id":"ktix01ni"}
+{"time":"2025-05-26T23:02:21.4160965-04:00","level":"INFO","msg":"sender: started","stream_id":"ktix01ni"}
+{"time":"2025-05-26T23:02:21.4160965-04:00","level":"INFO","msg":"handler: started","stream_id":"ktix01ni"}
+{"time":"2025-05-26T23:02:21.5738486-04:00","level":"INFO","msg":"Starting system monitor"}
+{"time":"2025-05-26T23:02:21.6402442-04:00","level":"INFO","msg":"Stopping system monitor"}
+{"time":"2025-05-26T23:02:21.6402442-04:00","level":"INFO","msg":"Stopped system monitor"}
+{"time":"2025-05-26T23:02:22.270305-04:00","level":"INFO","msg":"fileTransfer: Close: file transfer manager closed"}
+{"time":"2025-05-26T23:02:22.4129222-04:00","level":"INFO","msg":"handler: operation stats","stats":{}}
+{"time":"2025-05-26T23:02:22.4166039-04:00","level":"INFO","msg":"stream: closing","id":"ktix01ni"}
+{"time":"2025-05-26T23:02:22.4166039-04:00","level":"INFO","msg":"handler: closed","stream_id":"ktix01ni"}
+{"time":"2025-05-26T23:02:22.4166039-04:00","level":"INFO","msg":"writer: Close: closed","stream_id":"ktix01ni"}
+{"time":"2025-05-26T23:02:22.4166039-04:00","level":"INFO","msg":"sender: closed","stream_id":"ktix01ni"}
+{"time":"2025-05-26T23:02:22.4166039-04:00","level":"INFO","msg":"stream: closed","id":"ktix01ni"}
