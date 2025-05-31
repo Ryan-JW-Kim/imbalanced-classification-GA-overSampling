@@ -33,22 +33,25 @@ import wandb
 
 import matplotlib.pyplot as plt
 
-with open('../data.pickle', 'rb') as fh:
+with open('data.pickle', 'rb') as fh:
 	data_mapper = pickle.load(fh)
 
 class AUC_Optimizer(Problem):
 	population_size = 100
 	n_neighbours = 5
-	sequential = False
-	def __init__(self, X_train, y_train, X_val, y_val):
-		self.mutation_history = {}
+	log_every = 5
+	def __init__(self, X_train, y_train, X_val, y_val, X_test, Y_test, synthetic_samples, logger=None):
+		
 		self.generation_number = 0
 
 		self.X_train = X_train
 		self.y_train = y_train
-
 		self.X_val = X_val
 		self.y_val = y_val
+		self.X_TEST = X_test
+		self.Y_TEST = Y_test
+		self.logger = logger
+		self.synthetic_samples = synthetic_samples
 
 		self.training_data = X_train
 		self.n_instances = X_train.shape[0]
@@ -82,8 +85,81 @@ class AUC_Optimizer(Problem):
 			
 			num_samples.append(np.sum(instance))
 			values.append(inverse_AUC)
+		F = np.column_stack([values, num_samples])
+		self.generation_number += 1
+		
+		if self.logger is not None and self.generate_synthetic_examples % AUC_Optimizer.log_every == 0:
+			validation_aucs = []
+			test_aucs = []
+			pareto_indices = NonDominatedSorting().do(F, only_non_dominated_front=True)
+			synthetic_pareto_samples = 0
+			
+			for idx in pareto_indices:
+				instance = x[idx]
+				for sample in self.X_train[instance]:
+					for synthetic_sample in self.synthetic_samples:
+						if np.all(sample == synthetic_sample):
+							synthetic_pareto_samples += 1
+							break
 
-		out["F"] = np.column_stack([values, num_samples])
+				if np.sum(instance) >= AUC_Optimizer.n_neighbours:
+					model = KNeighborsClassifier(n_neighbors=AUC_Optimizer.n_neighbours)
+					model.fit(
+						self.X_train[instance], 
+						self.y_train[instance]
+					)
+					y_pred = model.predict(self.X_val)
+					validation_aucs.append(roc_auc_score(self.y_val, y_pred))
+					y_pred = model.predict(self.X_TEST)
+					test_aucs.append(roc_auc_score(self.Y_TEST, y_pred))
+				else:
+					validation_aucs.append(0)
+					test_aucs.append(0)
+					
+			validation_idx = np.argmax(validation_aucs)
+			test_idx = np.argmax(test_aucs)	
+			x_ideal_validation_instance = self.X_train[x[pareto_indices[validation_idx]]]
+			y_ideal_validation_instance = self.y_train[x[pareto_indices[validation_idx]]]
+			x_ideal_test_instance = self.X_train[x[pareto_indices[test_idx]]]
+			y_ideal_test_instance = self.y_train[x[pareto_indices[test_idx]]]
+
+			if len(x_ideal_validation_instance) >= AUC_Optimizer.n_neighbours:
+				model = KNeighborsClassifier(n_neighbors=AUC_Optimizer.n_neighbours)
+				model.fit(
+					x_ideal_validation_instance, 
+					y_ideal_validation_instance
+				)
+
+				y_pred = model.predict(self.X_val)
+				optimized_validation_auc = roc_auc_score(self.y_val, y_pred)
+				
+				y_pred = model.predict(self.X_TEST)
+				optimized_test_auc = roc_auc_score(self.Y_TEST, y_pred)
+			else:
+				optimized_validation_auc = 0
+				optimized_test_auc = 0
+
+			# Calculate metrics using ideal instance w.r.t test AUC
+			if len(x_ideal_test_instance) >= AUC_Optimizer.n_neighbours:
+				model = KNeighborsClassifier(n_neighbors=AUC_Optimizer.n_neighbours)
+				model.fit(
+					x_ideal_test_instance, 
+					y_ideal_test_instance
+				)
+				
+				y_pred = model.predict(self.X_TEST)
+				ideal_test_auc = roc_auc_score(self.Y_TEST, y_pred)
+			else:
+				ideal_test_auc
+
+			self.logger.log({
+				"validation/optimized_AUC": optimized_validation_auc,
+				"test/optimized_AUC": optimized_test_auc,
+				"test/ideal_AUC": ideal_test_auc,
+				"train/synthetic_pareto_samples": synthetic_pareto_samples
+			})
+
+		out["F"] = F
 			
 class DiverseCustomSampling(Sampling):
 	def __init__(self):
@@ -135,11 +211,6 @@ class ConditionalVAE(nn.Module):
 		z = self.reparameterize(mu, logvar)
 		return self.decode(z, y), mu, logvar
 
-def vae_loss(recon_x, x, mu, logvar):
-	recon_loss = nn.MSELoss()(recon_x, x)
-	kl_div = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
-	return recon_loss + kl_div
-
 class CustomDataset(Dataset):
 	def __init__(self, x_synthetic, x_true):
 		self.x = x_synthetic
@@ -151,7 +222,7 @@ class CustomDataset(Dataset):
 		y = self.y[ind]
 		return x, y
 
-def train(training_x, training_y, cvae, lr, epochs, batch_size):
+def train(training_x, training_y, cvae, lr, epochs, batch_size, beta, logger=None):
 	device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 	train_set = CustomDataset(torch.from_numpy(training_x), torch.from_numpy(training_y))
 	train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True)
@@ -165,19 +236,20 @@ def train(training_x, training_y, cvae, lr, epochs, batch_size):
 			y_batch = batch[1].to(device).float().unsqueeze(1)
 			
 			recon, mu, logvar = cvae(x_batch, y_batch)
-			# loss = vae_loss(recon, x_batch, mu, logvar)
 			recon_loss = nn.MSELoss()(recon, x_batch)
 			kl_div = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
-			loss = recon_loss + kl_div
+			loss = recon_loss + (kl_div*beta)
 	
 			optimizer.zero_grad()
 			loss.backward()
 			optimizer.step()
 			
 			total_loss += loss.item()
-
-		# print(f"Epoch {epoch + 1}, Loss: {total_loss / len(train_loader):.4f}")
-
+		if logger is not None:
+			logger.log({
+				"training loss": total_loss / len(train_loader)
+			})
+		
 	return cvae
 
 def generate_synthetic_examples(x_samples, y_samples, sample_variance, cvae, num_samples=None):
@@ -215,13 +287,6 @@ def generate_synthetic_examples(x_samples, y_samples, sample_variance, cvae, num
 
 	return np.array(synthetic_features)
 
-def load_prior_knowledge_data(data_key):
-	x_train = data_mapper[data_key]['x_train'] 
-	y_train = data_mapper[data_key]['y_train']
-	x_validation = data_mapper[data_key]['x_validation'] 
-	y_validation = data_mapper[data_key]['y_validation']
-	return {'train': (x_train, y_train), 'validation': (x_validation, y_validation)}
-
 def calculate_latent_dimension_variance(x, y, cvae):
 	device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 	with torch.no_grad():    
@@ -239,7 +304,27 @@ def add_synthetic_data(x_train, y_train, x_synthetic, y_synthetic):
 	y = np.concatenate((y_train, y_synthetic), axis=0)
 	return x, y
 
-def select_synthetic_survivors(result, x, synthetic_features):
+# def select_synthetic_survivors(result, x, synthetic_features):
+# 	all_samples = []
+# 	for instance in result.X:
+# 		for sample in x[instance]:
+# 			for stored_sample in all_samples:
+# 				if np.all(sample == stored_sample):
+# 					break
+# 			else:
+# 				all_samples.append(sample)
+
+# 	# If any of the individuals contain a sample which is synthetic, add it to the
+# 	# 'proven' synthetic sample list
+# 	synthesized_features = []
+# 	for sample in all_samples:
+# 		for synthetic_sample in synthetic_features:
+# 			if np.all(sample == synthetic_sample):
+# 				synthesized_features.append(synthetic_sample)
+# 				break
+# 	return synthesized_features
+
+def select_synthetic_survivors(result, x, real_samples):
 	all_samples = []
 	for instance in result.X:
 		for sample in x[instance]:
@@ -249,34 +334,48 @@ def select_synthetic_survivors(result, x, synthetic_features):
 			else:
 				all_samples.append(sample)
 
-	# If any of the individuals contain a sample which is synthetic, add it to the
-	# 'proven' synthetic sample list
 	synthesized_features = []
 	for sample in all_samples:
-		for synthetic_sample in synthetic_features:
-			if np.all(sample == synthetic_sample):
-				synthesized_features.append(synthetic_sample)
+		for real_sample in real_samples:
+			if np.all(sample == real_sample):
 				break
+		else:
+			synthesized_features.append(sample)
+			
 	return synthesized_features
 
-def execute(data_key):
-	
-	# Load datakey from data_mapper
-	data = load_prior_knowledge_data(data_key)	
-	x_train, y_train = data['train']
-	x_validation, y_validation = data['validation']
 
+def split_info(data_key):
+	segments = data_key.split('_')
+	split_num = segments[0]
+	dataset_name = '_'.join(segments[1:])
+	return split_num, dataset_name
+
+def calculate_IR(labels):
+	counts = pd.DataFrame(labels).value_counts()
+	return counts.max()/counts.min() 
+
+def execute_1(data_key, scheme_key):
+	
+	split_number, dataset_name = split_info(data_key)
+
+	x_train = data_mapper[data_key]['x_train'] 
+	y_train = data_mapper[data_key]['y_train']
+	x_validation = data_mapper[data_key]['x_validation'] 
+	y_validation = data_mapper[data_key]['y_validation']
+	x_test = data_mapper[data_key]['x_test'] 
+	y_test = data_mapper[data_key]['y_test']
+	
 	# Define configuration of cVAE
 	input_dim = x_train[0].shape[0]
 	device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 	cvae = ConditionalVAE(input_dim, 1, input_dim//2, 2).to(device)
 
 	# Train cVAE - just real training data
-	cvae = train(x_train, y_train, cvae, lr=1e-3, epochs=200, batch_size=20)
+	cvae = train(x_train, y_train, cvae, lr=1e-3, epochs=200, batch_size=20, beta=0.8)
 
 	# Calculate the variance of all samples (minority and majority) within the training data
 	variance = calculate_latent_dimension_variance(x_train, y_train, cvae)
-
 
 	# Extract the data of minority class samples
 	minority_label = pd.DataFrame(y_train).value_counts().argmin()
@@ -284,42 +383,260 @@ def execute(data_key):
 	minority_features = x_train[minority_indices]
 	minority_labels = y_train[minority_indices]
 
-	synthesized_features = []
+	# Initial states
+	all_surviving_samples = np.array([[None] * x_train.shape[1]])
+	first = True
 	new_x_train = x_train
 	new_y_train = y_train
+	
+	outside_loop = wandb.init(
+		project="GA Instance Selection Over Sampling", 
+		group=f"{scheme_key}:{dataset_name}",
+		name=data_key
+	)
 
-	for _ in range(5):
-		
+	for generation_iter in range(20):		
 		# Generate minority samples using cVAE latent space and +/- (variance/2)
-		synthetic_minority_features = generate_synthetic_examples(minority_features, minority_labels, variance, cvae)
-	
-		new_x_train, new_y_train = add_synthetic_data(x_train, y_train, synthetic_minority_features, [minority_labels[0]] * len(synthetic_minority_features))
-	
-		problem = AUC_Optimizer(new_x_train, new_y_train, x_validation, y_validation)
+		synthetic_minority_features = generate_synthetic_examples(minority_features, minority_labels, variance, cvae, num_samples=100)
+		new_x_train, new_y_train = add_synthetic_data(new_x_train, new_y_train, synthetic_minority_features, [minority_labels[0]] * len(synthetic_minority_features))
+		
+		# Optimize to filter low quality synthetic samples
+		ga_sampleFiltering = wandb.init(
+			project="GA Instance Selection Over Sampling", 
+			group=f"{scheme_key}:{generation_iter}:{dataset_name}",
+			name=data_key
+		)
+		problem = AUC_Optimizer(
+			new_x_train, new_y_train, 
+			x_validation, y_validation,
+			X_test=x_test,
+			Y_test=y_test,
+			synthetic_samples=np.concatenate((all_surviving_samples, synthetic_minority_features)),
+			logger=ga_sampleFiltering
+		)
 		algorithm = NSGA2(pop_size=AUC_Optimizer.population_size, sampling=DiverseCustomSampling(), crossover=HUX(), mutation=BitflipMutation(), eliminate_duplicates=True)
 		result = minimize(problem, algorithm, ('n_gen', AUC_Optimizer.population_size), save_history=False)
 		
 		# For each individual within the final pareto front
-		synthetic_survivors = select_synthetic_survivors(result, synthetic_minority_features)
+		synthetic_survivors = select_synthetic_survivors(result, new_x_train, synthetic_minority_features)
+
+		if first and len(synthetic_survivors) != 0:
+			all_surviving_samples = np.array(synthetic_survivors)
+			first = False
+
+		elif not first and len(synthetic_survivors) != 0:
+			all_surviving_samples = np.concatenate((all_surviving_samples, synthetic_survivors))
+
+		new_x_train, new_y_train = add_synthetic_data(x_train, y_train, all_surviving_samples, [minority_labels[0]] * len(all_surviving_samples))
+		
+		# new_x_train, new_y_train = add_synthetic_data(x_train, y_train, synthetic_survivors, [minority_labels[0]] * len(all_surviving_samples))
+
+		# Retrain cVAE upon these samples.
+		cVAE_training = wandb.init(
+			project="GA Instance Selection Over Sampling", 
+			group=f"{scheme_key}:{generation_iter}:{dataset_name}",
+			name=data_key
+		)
+		cvae = ConditionalVAE(input_dim, 1, input_dim//2, 2).to(device)
+		cvae = train(new_x_train, new_y_train, cvae, lr=1e-3, epochs=200, batch_size=20, beta=0.8, logger=cVAE_training)
+
+		outside_loop.log({
+			"samples saved": len(all_surviving_samples),
+			"surviving samples": len(synthetic_survivors),
+			"train/size": len(new_x_train),
+			"train/IR": calculate_IR(new_y_train)
+		})
+
+	outside_loop.finish()
+	return all_surviving_samples
+
+def execute_2(data_key, scheme_key):
+	
+	split_number, dataset_name = split_info(data_key)
+
+	x_train = data_mapper[data_key]['x_train'] 
+	y_train = data_mapper[data_key]['y_train']
+	x_validation = data_mapper[data_key]['x_validation'] 
+	y_validation = data_mapper[data_key]['y_validation']
+	x_test = data_mapper[data_key]['x_test'] 
+	y_test = data_mapper[data_key]['y_test']
+	
+	# Define configuration of cVAE
+	input_dim = x_train[0].shape[0]
+	device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+	cvae = ConditionalVAE(input_dim, 1, input_dim//2, 2).to(device)
+
+	# Train cVAE - just real training data
+	cvae = train(x_train, y_train, cvae, lr=1e-3, epochs=200, batch_size=20, beta=1)
+
+	# Calculate the variance of all samples (minority and majority) within the training data
+	variance = calculate_latent_dimension_variance(x_train, y_train, cvae)
+
+	# Extract the data of minority class samples
+	minority_label = pd.DataFrame(y_train).value_counts().argmin()
+	minority_indices = np.where(y_train==minority_label)[0]
+	minority_features = x_train[minority_indices]
+	minority_labels = y_train[minority_indices]
+
+	# Initial states
+	all_surviving_samples = np.array([[None] * x_train.shape[1]])
+	first = True
+	new_x_train = x_train
+	new_y_train = y_train
+	
+	outside_loop = wandb.init(
+		project="GA Instance Selection Over Sampling", 
+		group=f"{scheme_key}:{dataset_name}",
+		name=data_key
+	)
+
+	for generation_iter in range(5):		
+		# Generate minority samples using cVAE latent space and +/- (variance/2)
+		synthetic_minority_features = generate_synthetic_examples(minority_features, minority_labels, variance, cvae, num_samples=100)
+		new_x_train, new_y_train = add_synthetic_data(new_x_train, new_y_train, synthetic_minority_features, [minority_labels[0]] * len(synthetic_minority_features))
+		
+		# Optimize to filter low quality synthetic samples
+		ga_sampleFiltering = wandb.init(
+			project="GA Instance Selection Over Sampling", 
+			group=f"{scheme_key}:{generation_iter}:{dataset_name}",
+			name=data_key
+		)
+		problem = AUC_Optimizer(
+			new_x_train, new_y_train, 
+			x_validation, y_validation,
+			X_test=x_test,
+			Y_test=y_test,
+			synthetic_samples=np.concatenate((all_surviving_samples, synthetic_minority_features)),
+			logger=ga_sampleFiltering
+		)
+		algorithm = NSGA2(pop_size=AUC_Optimizer.population_size, sampling=DiverseCustomSampling(), crossover=HUX(), mutation=BitflipMutation(), eliminate_duplicates=True)
+		result = minimize(problem, algorithm, ('n_gen', AUC_Optimizer.population_size), save_history=False)
+		
+		# For each individual within the final pareto front
+		synthetic_survivors = select_synthetic_survivors(result, new_x_train, synthetic_minority_features)
+
+		if first and len(synthetic_survivors) != 0:
+			all_surviving_samples = np.array(synthetic_survivors)
+			first = False
+
+		elif not first and len(synthetic_survivors) != 0:
+			all_surviving_samples = np.concatenate((all_surviving_samples, synthetic_survivors))
+
+		new_x_train, new_y_train = add_synthetic_data(x_train, y_train, all_surviving_samples, [minority_labels[0]] * len(all_surviving_samples))
+		
+		# new_x_train, new_y_train = add_synthetic_data(x_train, y_train, synthetic_survivors, [minority_labels[0]] * len(all_surviving_samples))
+
+		# Retrain cVAE upon these samples.
+		cVAE_training = wandb.init(
+			project="GA Instance Selection Over Sampling", 
+			group=f"{scheme_key}:{generation_iter}:{dataset_name}",
+			name=data_key
+		)
+		cvae = ConditionalVAE(input_dim, 1, input_dim//2, 2).to(device)
+		cvae = train(new_x_train, new_y_train, cvae, lr=1e-3, epochs=200, batch_size=20, beta=1, logger=cVAE_training)
+
+		outside_loop.log({
+			"samples saved": len(all_surviving_samples),
+			"surviving samples": len(synthetic_survivors),
+			"train/size": len(new_x_train),
+			"train/IR": calculate_IR(new_y_train)
+		})
+
+	outside_loop.finish()
+	return all_surviving_samples
+
+def execute_3(data_key, scheme_key):
+	
+	split_number, dataset_name = split_info(data_key)
+
+	x_train = data_mapper[data_key]['x_train'] 
+	y_train = data_mapper[data_key]['y_train']
+	x_validation = data_mapper[data_key]['x_validation'] 
+	y_validation = data_mapper[data_key]['y_validation']
+	x_test = data_mapper[data_key]['x_test'] 
+	y_test = data_mapper[data_key]['y_test']
+	
+	# Define configuration of cVAE
+	input_dim = x_train[0].shape[0]
+	device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+	cvae = ConditionalVAE(input_dim, 1, input_dim//2, 2).to(device)
+	cvae = train(x_train, y_train, cvae, lr=1e-3, epochs=200, batch_size=20, beta=0.8)
+	variance = calculate_latent_dimension_variance(x_train, y_train, cvae)
+
+	# Extract the data of minority class samples
+	minority_label = pd.DataFrame(y_train).value_counts().argmin()
+	minority_indices = np.where(y_train==minority_label)[0]
+	minority_features = x_train[minority_indices]
+	minority_labels = y_train[minority_indices]
+
+	# Initial states
+	new_x_train = x_train
+	new_y_train = y_train
+	
+	outside_loop = wandb.init(
+		project="GA Instance Selection Over Sampling", 
+		group=f"{scheme_key}:{dataset_name}",
+		name=data_key
+	)
+
+	for generation_iter in range(20):		
+		synthetic_minority_features = generate_synthetic_examples(minority_features, minority_labels, variance, cvae, num_samples=100)
+		
+		new_x_train, new_y_train = add_synthetic_data(new_x_train, new_y_train, synthetic_minority_features, [minority_labels[0]] * len(synthetic_minority_features))
+		
+		# Optimize to filter low quality synthetic samples
+		ga_sampleFiltering = wandb.init(
+			project="GA Instance Selection Over Sampling", 
+			group=f"{scheme_key}:{generation_iter}:{dataset_name}",
+			name=data_key
+		)
+		problem = AUC_Optimizer(
+			new_x_train, new_y_train, 
+			x_validation, y_validation,
+			X_test=x_test,
+			Y_test=y_test,
+			synthetic_samples=np.concatenate((all_surviving_samples, synthetic_minority_features)),
+			logger=ga_sampleFiltering
+		)
+		algorithm = NSGA2(pop_size=AUC_Optimizer.population_size, sampling=DiverseCustomSampling(), crossover=HUX(), mutation=BitflipMutation(), eliminate_duplicates=True)
+		result = minimize(problem, algorithm, ('n_gen', AUC_Optimizer.population_size), save_history=False)
+		
+		# For each individual within the final pareto front
+		synthetic_survivors = select_synthetic_survivors(result, new_x_train, x_train)
 		
 		new_x_train, new_y_train = add_synthetic_data(x_train, y_train, synthetic_survivors, [minority_labels[0]] * len(synthetic_survivors))
 
 		# Retrain cVAE upon these samples.
-		cvae = ConditionalVAE(input_dim, 1, input_dim//2, 2).to(device)
-		cvae = train(new_x_train, new_y_train, cvae, lr=1e-3, epochs=200, batch_size=20)
+		cVAE_training = wandb.init(
+			project="GA Instance Selection Over Sampling", 
+			group=f"{scheme_key}:{generation_iter}:{dataset_name}",
+			name=data_key
+		)
+		cvae = train(new_x_train, new_y_train, cvae, lr=1e-3, epochs=200, batch_size=20, beta=0.8, logger=cVAE_training)
 
-	return synthesized_features
+		outside_loop.log({
+			"samples saved": len(all_surviving_samples),
+			"surviving samples": len(synthetic_survivors),
+			"train/size": len(new_x_train),
+			"train/IR": calculate_IR(new_y_train)
+		})
+
+	outside_loop.finish()
+	return all_surviving_samples
 
 if __name__ == "__main__":
-	
+	splits = pd.read_csv('data_splits.csv')
+
 	print(f"Started at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-	for data_key in data_mapper:
-		try:		
-			
-			if os.path.exists(f"results/{data_key}.result"): continue
-			synthetic_samples = execute(data_key)			
-			pd.DataFrame(synthetic_samples).to_csv(f'results/{data_key}.csv', index=False)
-			print(f"Done {data_key} at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-			
-		except Exception as e:
-			print(f"Error at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} - {e}")
+	for data_key in splits['yeast4']:
+		# try:		
+		print(f"Start {data_key} at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+		if os.path.exists(f"results/{data_key}.result"): continue
+		synthetic_samples = execute_1(data_key,"0_8_longrun-non-persist")		
+		# synthetic_samples = execute_2(data_key, "1_0")		
+		
+		# pd.DataFrame(synthetic_samples).to_csv(f'results/{data_key}.csv', index=False)
+		# print(f"\tDone {data_key} at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+
+		# except Exception as e:
+		# 	print(f"Error at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} - {e}")
