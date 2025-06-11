@@ -27,7 +27,7 @@ import wandb
 with open('data.pickle', 'rb') as fh:
 	data_mapper = pickle.load(fh)
 
-class AUC_Optimizer(Problem):
+class AUC_Filter(Problem):
 	population_size = 100
 	n_neighbours = 5
 	log_every = 5
@@ -143,7 +143,122 @@ class AUC_Optimizer(Problem):
 			})
 
 		out["F"] = F
+
+class AUC_Optimizer(Problem):
+	population_size = 100
+	n_neighbours = 5
+	log_every = 5
+	def __init__(self, X_train, y_train, X_val, y_val, X_test, Y_test, logger=None):
+		
+		self.generation_number = 0
+
+		self.X_train = X_train
+		self.y_train = y_train
+		self.X_val = X_val
+		self.y_val = y_val
+		self.X_TEST = X_test
+		self.Y_TEST = Y_test
+		self.logger = logger
+
+		self.training_data = X_train
+		self.n_instances = X_train.shape[0]
+		
+		super().__init__(
+			n_var=self.n_instances,
+			n_obj=1,               
+			n_constr=0,            
+			xl=0,                  
+			xu=1,                  
+			type_var=np.bool_,     
+		)
+
+	def _evaluate(self, x, out, *args, **kwargs):
+		
+		values = []
+		for instance in x:
+			inverse_AUC = 1
+			if np.sum(instance) >= AUC_Optimizer.n_neighbours:
+				model = KNeighborsClassifier(
+					n_neighbors=AUC_Optimizer.n_neighbours
+				)
+				model.fit(
+					self.X_train[instance], 
+					self.y_train[instance]
+				)
+
+				y_pred = model.predict(self.X_val)
+				inverse_AUC = 1 - roc_auc_score(self.y_val, y_pred)
 			
+			values.append(inverse_AUC)
+		F = np.column_stack([values])
+		self.generation_number += 1
+		
+		if self.logger is not None and self.generation_number % AUC_Optimizer.log_every == 0:
+			validation_aucs = []
+			test_aucs = []
+			pareto_indices = NonDominatedSorting().do(F, only_non_dominated_front=True)
+			
+			for idx in pareto_indices:
+				instance = x[idx]
+
+				if np.sum(instance) >= AUC_Optimizer.n_neighbours:
+					model = KNeighborsClassifier(n_neighbors=AUC_Optimizer.n_neighbours)
+					model.fit(
+						self.X_train[instance], 
+						self.y_train[instance]
+					)
+					y_pred = model.predict(self.X_val)
+					validation_aucs.append(roc_auc_score(self.y_val, y_pred))
+					y_pred = model.predict(self.X_TEST)
+					test_aucs.append(roc_auc_score(self.Y_TEST, y_pred))
+				else:
+					validation_aucs.append(0)
+					test_aucs.append(0)
+					
+			validation_idx = np.argmax(validation_aucs)
+			test_idx = np.argmax(test_aucs)	
+			x_ideal_validation_instance = self.X_train[x[pareto_indices[validation_idx]]]
+			y_ideal_validation_instance = self.y_train[x[pareto_indices[validation_idx]]]
+			x_ideal_test_instance = self.X_train[x[pareto_indices[test_idx]]]
+			y_ideal_test_instance = self.y_train[x[pareto_indices[test_idx]]]
+
+			if len(x_ideal_validation_instance) >= AUC_Optimizer.n_neighbours:
+				model = KNeighborsClassifier(n_neighbors=AUC_Optimizer.n_neighbours)
+				model.fit(
+					x_ideal_validation_instance, 
+					y_ideal_validation_instance
+				)
+
+				y_pred = model.predict(self.X_val)
+				optimized_validation_auc = roc_auc_score(self.y_val, y_pred)
+				
+				y_pred = model.predict(self.X_TEST)
+				optimized_test_auc = roc_auc_score(self.Y_TEST, y_pred)
+			else:
+				optimized_validation_auc = 0
+				optimized_test_auc = 0
+
+			# Calculate metrics using ideal instance w.r.t test AUC
+			if len(x_ideal_test_instance) >= AUC_Optimizer.n_neighbours:
+				model = KNeighborsClassifier(n_neighbors=AUC_Optimizer.n_neighbours)
+				model.fit(
+					x_ideal_test_instance, 
+					y_ideal_test_instance
+				)
+				
+				y_pred = model.predict(self.X_TEST)
+				ideal_test_auc = roc_auc_score(self.Y_TEST, y_pred)
+			else:
+				ideal_test_auc
+
+			self.logger.log({
+				"validation/optimized_AUC": optimized_validation_auc,
+				"test/optimized_AUC": optimized_test_auc,
+				"test/ideal_AUC": ideal_test_auc,
+			})
+
+		out["F"] = F
+
 class DiverseCustomSampling(Sampling):
 	def __init__(self):
 		super().__init__()
@@ -330,10 +445,9 @@ def calculate_IR(labels):
 	counts = pd.DataFrame(labels).value_counts()
 	return counts.max()/counts.min() 
 
-def execute(data_key, scheme_key):
+def execute(data_key):
 	
 	split_number, dataset_name = split_info(data_key)
-
 	x_train = data_mapper[data_key]['x_train'] 
 	y_train = data_mapper[data_key]['y_train']
 	x_validation = data_mapper[data_key]['x_validation'] 
@@ -346,49 +460,40 @@ def execute(data_key, scheme_key):
 	minority_features = x_train[minority_indices]
 	minority_labels = y_train[minority_indices]
 
-	cVAE_x_train, cVAE_y_train = combine_sets(x_train, y_train, x_validation, y_validation)
-
-	# Define configuration of cVAE
 	input_dim = x_train[0].shape[0]
 	device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 	cvae = ConditionalVAE(input_dim, 1, input_dim//2, 2).to(device)
+	cVAE_x_train, cVAE_y_train = combine_sets(x_train, y_train, x_validation, y_validation)
 	cvae = train(cVAE_x_train, cVAE_y_train, cvae, lr=1e-3, epochs=200, batch_size=20, beta=0.8)
-
 	variance = calculate_latent_dimension_variance(minority_features, minority_labels, cvae)
-
-	# Initial states
-	new_x_train = x_train
-	new_y_train = y_train
+	new_x_train, new_y_train = x_train, y_train
 
 	model = KNeighborsClassifier(n_neighbors=AUC_Optimizer.n_neighbours)
 	model.fit(x_train, y_train)
-
 	y_pred = model.predict(x_validation)
 	baseline_validation_AUC = roc_auc_score(y_validation, y_pred)
 	
 	logger = wandb.init(
 		project="GA Instance Selection Over Sampling", 
-		group=f"{scheme_key}:{dataset_name}",
+		group="cVAE-GA",
+		tags=['2025-06-08', dataset_name],		
 		name=data_key
 	)
 
-	survivor_by_run = []
+	for generation_iter in range(5):	
 
-	for generation_iter in range(10):			
 		synthetic_minority_features = generate_synthetic_examples(minority_features, minority_labels, variance, cvae)
 		candidate_x_train, candidate_y_train = combine_sets(new_x_train, new_y_train, synthetic_minority_features, [minority_labels[0]] * len(synthetic_minority_features))
 		
-		problem = AUC_Optimizer(
+		problem = AUC_Filter(
 			candidate_x_train, candidate_y_train, 
 			x_validation, y_validation,
-			X_test=x_test,
-			Y_test=y_test,
+			X_test=x_test, Y_test=y_test,
 			logger=logger
 		)
 		algorithm = NSGA2(pop_size=AUC_Optimizer.population_size, sampling=DiverseCustomSampling(), crossover=HUX(), mutation=BitflipMutation(), eliminate_duplicates=True)
 		result = minimize(problem, algorithm, ('n_gen', AUC_Optimizer.population_size), save_history=False)
 	
-		# For each individual within the final pareto front
 		synthetic_survivors = select_synthetic_survivors(
 			result, 
 			candidate_x_train, candidate_y_train,
@@ -397,22 +502,29 @@ def execute(data_key, scheme_key):
 			baseline_validation_AUC,
 		)
 
+		with open(f'results/{data_key} iter{generation_iter}.pickle', 'wb') as fh:
+			pickle.dump(
+				{
+					"Base x_train": candidate_x_train,
+					"Base y_train": candidate_y_train,
+					"Contrastive x_train": new_x_train,
+					"Result": result
+				},
+				fh
+			)
 		new_x_train, new_y_train = combine_sets(new_x_train, new_y_train, synthetic_survivors, [minority_labels[0]] * len(synthetic_survivors))
 
 		# Retrain cVAE upon these samples.
-		# cVAE_x_train, cVAE_y_train = combine_sets(new_x_train, new_y_train, x_validation, y_validation)
-		# cvae = ConditionalVAE(input_dim, 1, input_dim//2, 2).to(device)
-		# cvae = train(new_x_train, new_y_train, cvae, lr=1e-3, epochs=200, batch_size=20, beta=0.8, logger=logger)
+		cVAE_x_train, cVAE_y_train = combine_sets(new_x_train, new_y_train, x_validation, y_validation)
+		cvae = ConditionalVAE(input_dim, 1, input_dim//2, 2).to(device)
+		cvae = train(new_x_train, new_y_train, cvae, lr=1e-3, epochs=200, batch_size=20, beta=0.8, logger=logger)
 
 		logger.log({
 			"surviving samples": len(synthetic_survivors),
 			"train/size": len(new_x_train),
 			"train/IR": calculate_IR(new_y_train)
 		})
-
-	# ga_sampleFiltering.finish()
-	# cVAE_training.finish()
-	# outside_loop.finish()
+	
 	logger.finish()
 	return synthetic_survivors
 
@@ -449,14 +561,18 @@ if __name__ == "__main__":
 	splits = pd.read_csv('data_splits.csv')
 
 	print(f"Started at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-	# for data_key in splits['yeast4']:
-	# for data_key in splits['glass6']:
-	# for data_key in splits['abalone19']:
-	for data_key in splits['abalone-20_vs_8-9-10']:
-		try:
-			synthetic_samples = execute(data_key, "2025-06-04_persistNoRetrain")
-			baseline_run(data_key, f"2025-06-04_persistNoRetrain")
-			# pd.DataFrame(synthetic_samples).to_csv(f'results/{data_key}.csv', index=False)
-			print(data_key)
-		except Exception as e:
-			print(f"Error at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} - {e}")
+	print(F"Executing for:")
+	# for dataset in splits.columns[:len(splits.columns)//2]:
+	# 	print(f'- {dataset}')
+	# for dataset in splits.columns[len(splits.columns)//2:]:
+	# 	print(f'- {dataset}')
+
+	# for dataset in splits.columns[:len(splits.columns)//2]:
+	for dataset in splits.columns[len(splits.columns)//2:]:
+		for data_key in splits[dataset]:
+			try:
+				synthetic_samples = execute(data_key)
+				# pd.DataFrame(synthetic_samples).to_csv(f'results/{data_key}.csv', index=False)
+				print(data_key)
+			except Exception as e:
+				print(f"Error at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} - {e}")	
