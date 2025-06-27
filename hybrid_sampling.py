@@ -33,7 +33,7 @@ class AUC_Filter(Problem):
 	population_size = 100
 	n_neighbours = 5
 	log_every = 5
-	def __init__(self, X_train, y_train, X_val, y_val, logger=None):
+	def __init__(self, X_train, y_train, X_val, y_val, x_test, y_test, logger=None):
 		
 		self.generation_number = 0
 
@@ -41,8 +41,8 @@ class AUC_Filter(Problem):
 		self.y_train = y_train
 		self.X_val = X_val
 		self.y_val = y_val
-		# self.X_TEST = X_test
-		# self.Y_TEST = Y_test
+		self.X_TEST = x_test
+		self.Y_TEST = y_test
 		self.logger = logger
 
 		self.training_data = X_train
@@ -146,89 +146,154 @@ class AUC_Filter(Problem):
 
 		out["F"] = F
 
-
-class DiverseCustomSampling(Sampling):
-	def __init__(self):
+class DiverseInheritedSampling(Sampling):
+	def __init__(self, curr_x_train, prev_samples):
 		super().__init__()
+
+		self.inherited_pops = []
+
+		for x, y in prev_samples:
+			individual = np.zeros(len(curr_x_train))
+			for feature in x:
+				idx = np.argwhere(curr_x_train==feature)		
+				individual[idx] = 1
+			self.inherited_pops.append(individual)
 
 	def _do(self, problem, n_samples, **kwargs):
 
 		target_inclusions = np.random.randint(
 			problem.n_var // 3,
 			problem.n_var,
-			n_samples
+			n_samples-len(self.inherited_pops)
 		)
 		init_pops = []
 		for target in target_inclusions:
 			array = np.array([1]*target + [0]*(problem.n_var - target))
 			np.random.shuffle(array)
 			init_pops.append(array)
+		
+		init_pops.extend(self.inherited_pops)
 		init_pops = np.array(init_pops, dtype=np.bool)
 	
 		return init_pops
 
-def execute(data_key, x_train, y_train, x_validation, y_validation, WARNING_TEST_X, WARNING_TEST_Y):
-	print(f">{x_train.shape}")
-	print(f"{pd.DataFrame(y_train).value_counts()}")
-	# for idx in range(len(x_train)):
-	# 	print(x_train[idx,:].shape)
+def execute(data_key, x_train, y_train, x_validation, y_validation, x_test, y_test):
 	
-	synthetic_features = None
-	synthetic_labels = None
-	real_idx = len(x_train)
-	for sampler in [SMOTE, ADASYN, BorderlineSMOTE]:
+	segments = data_key.split('_')
+	split_num = segments[0]
+	dataset_name = '_'.join(segments[1:])
 
-		sampler = sampler(sampling_strategy='minority')
-		oversample_x, oversample_y = sampler.fit_resample(x_train, y_train)
+	logger = wandb.init(
+			project="GA Instance Selection Over Sampling", 
+			group="hybridSample",
+			tags=['2025-06-27', dataset_name],		
+			name=data_key
+		)
+	strong_performers = []
+	curr_x_train = x_train
+	curr_y_train = y_train
+	for _ in range(5):
+		print(f"\tIter{_}")
 
-		model = KNeighborsClassifier(n_neighbors=AUC_Filter.n_neighbours)
-		model.fit(oversample_x, oversample_y)
-		y_pred = model.predict(x_validation)
-		print(f"{sampler} AUC: {roc_auc_score(y_validation, y_pred)}")
+		################################################# 
+		# Generate the synthetic samples using only training data.
+		# While doing so, track the maxima AUC expected
+		# pre-optimization to filter which samples are
+		# to be inherited to the next iteration.
+		#################################################
 
-		if synthetic_features is not None:
-			synthetic_features = np.concatenate((synthetic_features, oversample_x[real_idx:]))
-			synthetic_labels = np.concatenate((synthetic_labels, oversample_y[real_idx:]))
-		else:
-			synthetic_features = oversample_x[real_idx:]
-			synthetic_labels = oversample_y[real_idx:]
+		baseline_AUC = -1
+		synthetic_features, synthetic_labels = None, None
+		
+		carry_over_x = []
+		carry_over_y = []
+		for x, y in strong_performers:
+			for feature, label in zip(x, y):
+				
+				for real_feature in x_train:
+					if np.all(feature == real_feature):
+						break
+				else:
+					for prior_feature in carry_over_x:
+						if np.all(feature == prior_feature):
+							break
+					else:
+						carry_over_x.append(feature)
+						carry_over_y.append(label)
 
-	candidate_x_train = np.concatenate((x_train, synthetic_features))
-	candidate_y_train = np.concatenate((y_train, synthetic_labels))
+		if carry_over_x != []:
+			curr_x_train = np.concatenate((x_train, carry_over_x), axis=0)
+			curr_y_train = np.concatenate((y_train, carry_over_y), axis=0)
 
-	problem = AUC_Filter(
-		candidate_x_train, candidate_y_train, 
-		x_validation, y_validation,
-	)
-	algorithm = NSGA2(pop_size=AUC_Filter.population_size, sampling=DiverseCustomSampling(), crossover=HUX(), mutation=BitflipMutation(), eliminate_duplicates=True)
-	result = minimize(problem, algorithm, ('n_gen', AUC_Filter.population_size), save_history=False)
-	
-	validation_auc = []
-	for instance in result.X:
-		if np.sum(instance) >= AUC_Filter.n_neighbours:
+		new_idx = len(curr_x_train)
+
+		for sampler in [SMOTE, ADASYN, BorderlineSMOTE]:
+		
+			sampler = sampler(sampling_strategy='minority')
+			oversample_x, oversample_y = sampler.fit_resample(curr_x_train, curr_y_train)
+
 			model = KNeighborsClassifier(n_neighbors=AUC_Filter.n_neighbours)
-			model.fit(candidate_x_train[instance], candidate_y_train[instance] )
+			model.fit(oversample_x, oversample_y)
 			y_pred = model.predict(x_validation)
-			validation_auc.append(roc_auc_score(y_validation, y_pred))
-		else:
+			auc = roc_auc_score(y_validation, y_pred)
+			if  auc > baseline_AUC:
+				baseline_AUC = auc
 
-			validation_auc.append(0)
+			if synthetic_features is not None:
+				synthetic_features = np.concatenate((synthetic_features, oversample_x[new_idx:]))
+				synthetic_labels = np.concatenate((synthetic_labels, oversample_y[new_idx:]))
+			else:
+				synthetic_features = oversample_x[new_idx:]
+				synthetic_labels = oversample_y[new_idx:]
 
-	model = KNeighborsClassifier(n_neighbors=AUC_Filter.n_neighbours)
-	model.fit(x_train, y_train)
-	y_pred = model.predict(WARNING_TEST_X)
-	print(f"Baseline test AUC: {roc_auc_score(WARNING_TEST_Y, y_pred)}")
-	
-	print(f"Optimized validation AUC: {np.max(validation_auc)}")
-	best_idx = np.argmax(validation_auc)
-	validation_best_instance = result.X[best_idx]
-	model = KNeighborsClassifier(n_neighbors=AUC_Filter.n_neighbours)
+		candidate_x_train = np.concatenate((curr_x_train, synthetic_features))
+		candidate_y_train = np.concatenate((curr_y_train, synthetic_labels))
 
-	model.fit(candidate_x_train[validation_best_instance], candidate_y_train[validation_best_instance] )
-	y_pred = model.predict(WARNING_TEST_X)
-	print(f"Optimized test AUC: {roc_auc_score(WARNING_TEST_Y, y_pred)}")
-	
-	print(synthetic_features.shape)
+		#################################################
+		# Execute optimization filtering.
+		# Given the synthetic samples of SMOTE, ADASYN, and BorderlineSMOTE
+		# NSGA-II will attempt to optimize for AUC and number of samples.
+		#################################################
+
+		problem = AUC_Filter(
+			candidate_x_train, candidate_y_train, 
+			x_validation, y_validation,
+			x_test, y_test,
+			logger
+		)
+		algorithm = NSGA2(
+			pop_size=AUC_Filter.population_size, 
+			sampling=DiverseInheritedSampling(candidate_x_train, strong_performers), 
+			crossover=HUX(), 
+			mutation=BitflipMutation(), 
+			eliminate_duplicates=True
+		)
+		result = minimize(
+			problem, 
+			algorithm, 
+			('n_gen', AUC_Filter.population_size), 
+			save_history=False
+		)
+
+		#################################################
+		# For each individual in the final population track
+		# the AUC, save it if the AUC is greater than the baseline 
+		# AUC expected with any one of SMOTE, ADAYSN, etc.
+		#################################################
+
+		strong_performers = []
+		# print(result.pop)
+		for indidivual in result.pop:
+			instance = indidivual.X
+			if np.sum(instance) >= AUC_Filter.n_neighbours:
+				model = KNeighborsClassifier(n_neighbors=AUC_Filter.n_neighbours)
+				model.fit(candidate_x_train[instance], candidate_y_train[instance] )
+				y_pred = model.predict(x_validation)
+				if roc_auc_score(y_validation, y_pred) > baseline_AUC:
+					strong_performers.append((
+						candidate_x_train[instance],
+						candidate_y_train[instance]
+					))
 
 if __name__ == "__main__":
 
@@ -250,5 +315,5 @@ if __name__ == "__main__":
 				data_mapper[data_key]['y_test'],
 			)
 
-			break
+			
 		break
