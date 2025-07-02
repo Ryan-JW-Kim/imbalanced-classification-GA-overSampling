@@ -30,7 +30,6 @@ import wandb
 
 
 class AUC_Filter(Problem):
-	population_size = 100
 	n_neighbours = 5
 	log_every = 5
 	def __init__(self, X_train, y_train, X_val, y_val, x_test, y_test, logger=None):
@@ -50,6 +49,7 @@ class AUC_Filter(Problem):
 		
 		super().__init__(
 			n_var=self.n_instances,
+			# n_obj=1,
 			n_obj=2,               
 			n_constr=0,            
 			xl=0,                  
@@ -77,87 +77,197 @@ class AUC_Filter(Problem):
 			
 			num_samples.append(np.sum(instance))
 			values.append(inverse_AUC)
+
 		F = np.column_stack([values, num_samples])
+		# F = np.column_stack([values])
+
 		self.generation_number += 1
-		
+		max_validation_auc = -1
+		real_test_auc = -1
+		max_test_auc = -1
 		if self.logger is not None and self.generation_number % AUC_Filter.log_every == 0:
-			validation_aucs = []
-			test_aucs = []
-			pareto_indices = NonDominatedSorting().do(F, only_non_dominated_front=True)
-			
-			for idx in pareto_indices:
+			for idx in NonDominatedSorting().do(F, only_non_dominated_front=True):
 				instance = x[idx]
 
 				if np.sum(instance) >= AUC_Filter.n_neighbours:
 					model = KNeighborsClassifier(n_neighbors=AUC_Filter.n_neighbours)
-					model.fit(
-						self.X_train[instance], 
-						self.y_train[instance]
-					)
+					model.fit(self.X_train[instance], self.y_train[instance])
 					y_pred = model.predict(self.X_val)
-					validation_aucs.append(roc_auc_score(self.y_val, y_pred))
+					validation_auc = roc_auc_score(self.y_val, y_pred)
+
 					y_pred = model.predict(self.X_TEST)
-					test_aucs.append(roc_auc_score(self.Y_TEST, y_pred))
-				else:
-					validation_aucs.append(0)
-					test_aucs.append(0)
+					test_auc = roc_auc_score(self.Y_TEST, y_pred)
+				
+					if test_auc > max_test_auc:
+						max_test_auc = test_auc
 					
-			validation_idx = np.argmax(validation_aucs)
-			test_idx = np.argmax(test_aucs)	
-			x_ideal_validation_instance = self.X_train[x[pareto_indices[validation_idx]]]
-			y_ideal_validation_instance = self.y_train[x[pareto_indices[validation_idx]]]
-			x_ideal_test_instance = self.X_train[x[pareto_indices[test_idx]]]
-			y_ideal_test_instance = self.y_train[x[pareto_indices[test_idx]]]
-
-			if len(x_ideal_validation_instance) >= AUC_Filter.n_neighbours:
-				model = KNeighborsClassifier(n_neighbors=AUC_Filter.n_neighbours)
-				model.fit(
-					x_ideal_validation_instance, 
-					y_ideal_validation_instance
-				)
-
-				y_pred = model.predict(self.X_val)
-				optimized_validation_auc = roc_auc_score(self.y_val, y_pred)
-				
-				y_pred = model.predict(self.X_TEST)
-				optimized_test_auc = roc_auc_score(self.Y_TEST, y_pred)
-			else:
-				optimized_validation_auc = 0
-				optimized_test_auc = 0
-
-			# Calculate metrics using ideal instance w.r.t test AUC
-			if len(x_ideal_test_instance) >= AUC_Filter.n_neighbours:
-				model = KNeighborsClassifier(n_neighbors=AUC_Filter.n_neighbours)
-				model.fit(
-					x_ideal_test_instance, 
-					y_ideal_test_instance
-				)
-				
-				y_pred = model.predict(self.X_TEST)
-				ideal_test_auc = roc_auc_score(self.Y_TEST, y_pred)
-			else:
-				ideal_test_auc
+					if validation_auc > max_validation_auc:
+						max_validation_auc = validation_auc
+						real_test_auc = test_auc
 
 			self.logger.log({
-				"validation/optimized_AUC": optimized_validation_auc,
-				"test/optimized_AUC": optimized_test_auc,
-				"test/ideal_AUC": ideal_test_auc,
+				"validation/optimized_AUC": max_validation_auc,
+				"test/optimized_AUC": real_test_auc,
+				"test/ideal_AUC": max_test_auc,
 			})
 
 		out["F"] = F
 
+class ConditionalVAE(nn.Module):
+	def __init__(self, input_dim, label_dim, hidden_dim, latent_dim):
+		super(ConditionalVAE, self).__init__()
+		self.fc1 = nn.Linear(input_dim + label_dim, hidden_dim)
+		self.fc_mu = nn.Linear(hidden_dim, latent_dim)
+		self.fc_logvar = nn.Linear(hidden_dim, latent_dim)
+		self.fc2 = nn.Linear(latent_dim + label_dim, hidden_dim)
+		self.fc3 = nn.Linear(hidden_dim, input_dim)
+
+	def encode(self, x, y):
+		# Concatenate input and label
+		x = torch.cat([x, y], dim=1)
+		h = torch.relu(self.fc1(x))
+		return self.fc_mu(h), self.fc_logvar(h)
+
+	def reparameterize(self, mu, logvar):
+		std = torch.exp(0.5 * logvar)
+		eps = torch.randn_like(std)
+		return mu + eps * std
+
+	def decode(self, z, y):
+		# Concatenate latent vector and label
+		z = torch.cat([z, y], dim=1)
+		h = torch.relu(self.fc2(z))
+		return self.fc3(h)
+
+	def forward(self, x, y):
+		mu, logvar = self.encode(x, y)
+		z = self.reparameterize(mu, logvar)
+		return self.decode(z, y), mu, logvar
+
+class TabularDataset(Dataset):
+	def __init__(self, x_synthetic, x_true):
+		self.x = x_synthetic
+		self.y = x_true
+	def __len__(self):
+		return self.x.shape[0]
+	def __getitem__(self, ind):
+		x = self.x[ind]
+		y = self.y[ind]
+		return x, y
+
+class cVAE:
+	def __init__(self, sampling_strategy):
+		pass
+
+	def fit_resample(self, x, y):
+		lr = 1e-3
+		epochs = 200
+		batch_size = 20
+		beta = 0.8
+		input_dim = x[0].shape[0]
+
+		minority_label = pd.DataFrame(y).value_counts().argmin()
+		minority_indices = np.where(y==minority_label)[0]
+		minority_features = x[minority_indices]
+		minority_labels = y[minority_indices]
+
+		device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+		train_set = TabularDataset(torch.from_numpy(x), torch.from_numpy(y))
+		train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True)
+		cvae = ConditionalVAE(input_dim, 1, input_dim//2, 2).to(device)
+		optimizer = optim.Adam(cvae.parameters(), lr=lr)
+		cvae.train()
+
+		##############################
+		#
+		##############################
+
+		for epoch in range(epochs):
+			total_loss = 0
+			for batch in train_loader:
+				x_batch = batch[0].to(device).float()
+				y_batch = batch[1].to(device).float().unsqueeze(1)
+				
+				recon, mu, logvar = cvae(x_batch, y_batch)
+				recon_loss = nn.MSELoss()(recon, x_batch)
+				kl_div = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
+				loss = recon_loss + (kl_div*beta)
+		
+				optimizer.zero_grad()
+				loss.backward()
+				optimizer.step()
+				
+				total_loss += loss.item()
+
+		#################################
+		#
+		#################################
+
+		cvae.eval()
+		with torch.no_grad():    
+			temp_x = torch.from_numpy(minority_features).to(device).float()
+			temp_y = torch.from_numpy(minority_labels).to(device).float().unsqueeze(1)
+			mu, logvar = cvae.encode(temp_x, temp_y)
+			z = cvae.reparameterize(mu, logvar)
+			total_latents = z.cpu().numpy()
+			variance = np.var(total_latents, axis=0)
+	
+		################################
+		#
+		################################
+
+		synthetic_features = []
+		num_samples = 50
+		while len(synthetic_features) < num_samples:
+			with torch.no_grad():    
+				temp_x = torch.from_numpy(minority_features).to(device).float()
+				temp_y = torch.from_numpy(minority_labels).to(device).float().unsqueeze(1)
+				mu, logvar = cvae.encode(temp_x, temp_y)
+				z = cvae.reparameterize(mu, logvar)
+			minority_latents = z.cpu().numpy()
+
+			for dim in range(2):
+				minority_latents[:,dim] += np.random.normal(-variance[dim]/2, variance[dim]/2, len(minority_latents))
+			
+			with torch.no_grad():    
+				z = torch.from_numpy(minority_latents).to(device).float()
+				label_dim = torch.from_numpy(minority_labels).to(device).float().unsqueeze(1)
+				synthetic_minority_samples = cvae.decode(z, label_dim)
+		
+			for sample in synthetic_minority_samples.cpu().numpy():
+				if len(synthetic_features) < num_samples:
+					synthetic_features.append(sample)
+				else:
+					break
+				
+		x = np.concatenate((x, np.array(synthetic_features)), axis=0)
+		y = np.concatenate((y, [minority_labels[0]] * len(synthetic_features)), axis=0)
+		return x, y
+	
 class DiverseInheritedSampling(Sampling):
 	def __init__(self, curr_x_train, prev_samples):
 		super().__init__()
 
 		self.inherited_pops = []
+		# print(f"There were {len(prev_samples)} inherited")
 
+		# print(f"Shape of curr x_train {curr_x_train.shape}")
 		for x, y in prev_samples:
 			individual = np.zeros(len(curr_x_train))
 			for feature in x:
-				idx = np.argwhere(curr_x_train==feature)		
-				individual[idx] = 1
+
+				idx = None
+				for idx, positioned_feature in enumerate(curr_x_train):
+					# print(f"Comparing {len(positioned_feature)} and {len(feature)}")
+					if np.all(positioned_feature == feature):
+						break
+				else:
+					# print(f"Set {idx} to 1")
+					individual[idx] = 1
+				
 			self.inherited_pops.append(individual)
+
+		print(f"I preprocessed {len(self.inherited_pops)} individuals")
 
 	def _do(self, problem, n_samples, **kwargs):
 
@@ -171,27 +281,39 @@ class DiverseInheritedSampling(Sampling):
 			array = np.array([1]*target + [0]*(problem.n_var - target))
 			np.random.shuffle(array)
 			init_pops.append(array)
-		
+		# print(f"Randomly generated {len(init_pops)} individuals")
 		init_pops.extend(self.inherited_pops)
+
+		# print(f"Final population size {len(init_pops)}")
+
 		init_pops = np.array(init_pops, dtype=np.bool)
 	
 		return init_pops
 
 def execute(data_key, x_train, y_train, x_validation, y_validation, x_test, y_test):
-	
+	performance_history = []
 	segments = data_key.split('_')
 	split_num = segments[0]
 	dataset_name = '_'.join(segments[1:])
 
+	logger = None
 	logger = wandb.init(
 			project="GA Instance Selection Over Sampling", 
 			group="hybridSample",
-			tags=['2025-06-27', dataset_name],		
+			tags=['2025-07-01', dataset_name],		
 			name=data_key
 		)
+
 	strong_performers = []
 	curr_x_train = x_train
 	curr_y_train = y_train
+
+	model = KNeighborsClassifier(n_neighbors=AUC_Filter.n_neighbours)
+	model.fit(x_train, y_train)
+	y_pred = model.predict(x_validation)
+	baseline_AUC = roc_auc_score(y_validation, y_pred)
+
+	# max_validation_auc
 	for _ in range(5):
 		print(f"\tIter{_}")
 
@@ -202,9 +324,8 @@ def execute(data_key, x_train, y_train, x_validation, y_validation, x_test, y_te
 		# to be inherited to the next iteration.
 		#################################################
 
-		baseline_AUC = -1
 		synthetic_features, synthetic_labels = None, None
-		
+	
 		carry_over_x = []
 		carry_over_y = []
 		for x, y in strong_performers:
@@ -220,16 +341,18 @@ def execute(data_key, x_train, y_train, x_validation, y_validation, x_test, y_te
 					else:
 						carry_over_x.append(feature)
 						carry_over_y.append(label)
-
+			
 		if carry_over_x != []:
 			curr_x_train = np.concatenate((x_train, carry_over_x), axis=0)
 			curr_y_train = np.concatenate((y_train, carry_over_y), axis=0)
 
 		new_idx = len(curr_x_train)
 
-		for sampler in [SMOTE, ADASYN, BorderlineSMOTE]:
+		for sampler in [SMOTE, ADASYN, BorderlineSMOTE, cVAE]:
 		
 			sampler = sampler(sampling_strategy='minority')
+
+			# try:
 			oversample_x, oversample_y = sampler.fit_resample(curr_x_train, curr_y_train)
 
 			model = KNeighborsClassifier(n_neighbors=AUC_Filter.n_neighbours)
@@ -245,6 +368,8 @@ def execute(data_key, x_train, y_train, x_validation, y_validation, x_test, y_te
 			else:
 				synthetic_features = oversample_x[new_idx:]
 				synthetic_labels = oversample_y[new_idx:]
+			# except Exception as e:
+			# 	print(f"Didnt generate new samples because {e}")
 
 		candidate_x_train = np.concatenate((curr_x_train, synthetic_features))
 		candidate_y_train = np.concatenate((curr_y_train, synthetic_labels))
@@ -262,7 +387,7 @@ def execute(data_key, x_train, y_train, x_validation, y_validation, x_test, y_te
 			logger
 		)
 		algorithm = NSGA2(
-			pop_size=AUC_Filter.population_size, 
+			pop_size=500, 
 			sampling=DiverseInheritedSampling(candidate_x_train, strong_performers), 
 			crossover=HUX(), 
 			mutation=BitflipMutation(), 
@@ -271,7 +396,7 @@ def execute(data_key, x_train, y_train, x_validation, y_validation, x_test, y_te
 		result = minimize(
 			problem, 
 			algorithm, 
-			('n_gen', AUC_Filter.population_size), 
+			('n_gen', 100), 
 			save_history=False
 		)
 
@@ -282,26 +407,41 @@ def execute(data_key, x_train, y_train, x_validation, y_validation, x_test, y_te
 		#################################################
 
 		strong_performers = []
+		candidate_inherited_samples = []
+		samples_auc = []
 		# print(result.pop)
+		
 		for indidivual in result.pop:
 			instance = indidivual.X
 			if np.sum(instance) >= AUC_Filter.n_neighbours:
+
 				model = KNeighborsClassifier(n_neighbors=AUC_Filter.n_neighbours)
 				model.fit(candidate_x_train[instance], candidate_y_train[instance] )
 				y_pred = model.predict(x_validation)
-				if roc_auc_score(y_validation, y_pred) > baseline_AUC:
-					strong_performers.append((
-						candidate_x_train[instance],
-						candidate_y_train[instance]
-					))
+				curr_auc = roc_auc_score(y_validation, y_pred)
+				
+				if curr_auc > baseline_AUC:
+					samples_auc.append(curr_auc)
+					candidate_inherited_samples.append((candidate_x_train[instance], candidate_y_train[instance]))
+		
+		save_count = 20
+		count = 0
+		indices = np.argsort(samples_auc)
+		for idx in indices[::-1]:
+			if count > save_count: break
+			count += 1
+			strong_performers.append(candidate_inherited_samples[idx])
+
+
+	if logger is not None:
+		logger.finish()
 
 if __name__ == "__main__":
 
 	with open('data.pickle', 'rb') as fh:
 		data_mapper = pickle.load(fh)
 	splits = pd.read_csv('data_splits.csv')
-
-
+	
 	for dataset in splits.columns:
 		for data_key in splits[dataset]:
 			print(data_key)
@@ -314,6 +454,5 @@ if __name__ == "__main__":
 				data_mapper[data_key]['x_test'],
 				data_mapper[data_key]['y_test'],
 			)
-
 			
 		break
