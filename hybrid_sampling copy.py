@@ -39,7 +39,7 @@ import wandb
 class AUC_Filter(Problem):
 	n_neighbours = 5
 	log_every = 5
-	def __init__(self, X_train, y_train, X_val, y_val, x_test, y_test, logger=None):
+	def __init__(self, X_train, y_train, X_val, y_val, x_test, y_test, inclusion_threshold, logger=None):
 		
 		self.generation_number = 0
 
@@ -51,25 +51,28 @@ class AUC_Filter(Problem):
 		self.Y_TEST = y_test
 		self.logger = logger
 
+		self.high_performers = []
+		self.inclusion_threshold = inclusion_threshold
+
 		self.training_data = X_train
 		self.n_instances = X_train.shape[0]
 		
 		super().__init__(
 			n_var=self.n_instances,
-			n_obj=1,
-			# n_obj=2,               
+			# n_obj=1,
+			n_obj=2,               
 			n_constr=0,            
 			xl=0,                  
 			xu=1,                  
 			type_var=np.bool_,     
 		)
 
-	@classmethod 
-	def train(cls, instance, x1, y1, x2, y2):
+	 
+	def train(self, instance, x1, y1, x2, y2):
 		
-		if np.sum(instance) >= cls.n_neighbours:
+		if np.sum(instance) >= AUC_Filter.n_neighbours:
 			model = KNeighborsClassifier(
-				n_neighbors=cls.n_neighbours
+				n_neighbors=AUC_Filter.n_neighbours
 			)
 			model.fit(
 				x1[instance], 
@@ -77,14 +80,22 @@ class AUC_Filter(Problem):
 			)
 
 			y_pred = model.predict(x2)
-			return 1 - roc_auc_score(y2, y_pred)
+			auc = roc_auc_score(y2, y_pred)
 
-		return 1
+			if auc > self.inclusion_threshold:
+				self.high_performers.append((x1[instance], y1[instance]))
+
+			return (1 - auc, np.sum(instance))
+
+		return (1, np.sum(instance))
 	
 	def _evaluate(self, x, out, *args, **kwargs):
 		
-		values = Parallel(n_jobs=-1)(delayed(AUC_Filter.train)(instance, self.X_train, self.y_train, self.X_val, self.y_val) for instance in x)
-		F = np.column_stack(values)
+		results = Parallel(n_jobs=-1)(delayed(self.train)(instance, self.X_train, self.y_train, self.X_val, self.y_val) for instance in x)
+		auc = [result[0] for result in results]
+		num_samples = [result[1] for result in results]
+
+		F = np.column_stack([auc, num_samples])
 
 		self.generation_number += 1
 		max_validation_auc = -1
@@ -293,7 +304,7 @@ def execute(data_key, x_train, y_train, x_validation, y_validation, x_test, y_te
 	logger = wandb.init(
 			project="GA Instance Selection Over Sampling", 
 			group="hybridSample",
-			tags=['2025-07-07-revised', dataset_name],		
+			tags=['2025-07-09-TEST1', dataset_name],		
 			name=data_key
 		)
 
@@ -367,9 +378,8 @@ def execute(data_key, x_train, y_train, x_validation, y_validation, x_test, y_te
 				# this ensures the filter will only save
 				# samples from instances who perform better than
 				# the baseline.
-				print(f"\t{round(auc, 4)}")
-				if  auc > baseline_AUC:
-					baseline_AUC = auc
+				# if  auc > baseline_AUC:
+				# 	baseline_AUC = auc
 
 				if synthetic_features is not None:
 					synthetic_features = np.concatenate((synthetic_features, oversample_x[new_idx:]))
@@ -380,7 +390,11 @@ def execute(data_key, x_train, y_train, x_validation, y_validation, x_test, y_te
 			except Exception as e:
 				print(f"\tDidnt generate new samples because {e}")
 
-		print(f"\t AUC to beat {round(baseline_AUC, 4)}")
+		if logger is not None:
+			logger.log({"validation/filter_auc": baseline_AUC})
+		
+		baseline_AUC = -1
+		print(f"Must beat: {baseline_AUC}")
 
 		# Create the candidate training set, with the synthetic features minus the validation
 		# set that was used to create the samples.
@@ -397,6 +411,7 @@ def execute(data_key, x_train, y_train, x_validation, y_validation, x_test, y_te
 			candidate_x_train, candidate_y_train, 
 			x_validation, y_validation,
 			x_test, y_test,
+			baseline_AUC,
 			logger
 		)
 		algorithm = NSGA2(
@@ -450,7 +465,16 @@ def execute(data_key, x_train, y_train, x_validation, y_validation, x_test, y_te
 					max_test_auc = test_auc
 					ideal_num_samles = np.sum(instance)
 				############################################
-		
+			else:
+				print(f"Error")
+
+		for x, y in result.problem.high_performers:
+			model = KNeighborsClassifier(n_neighbors=AUC_Filter.n_neighbours)
+			model.fit(x, y)
+			y_pred = model.predict(x_validation)
+			validation_auc = roc_auc_score(y_validation, y_pred)
+			samples_auc.append(validation_auc)
+			candidate_inherited_samples.append((x,y))
 		# Save the best 20 instances
 		# which had performance better
 		# than the pre-optimization 
@@ -458,11 +482,14 @@ def execute(data_key, x_train, y_train, x_validation, y_validation, x_test, y_te
 		# strong_performers = []
 		count, save_count = 0, 20
 		indices = np.argsort(samples_auc)
+		print(np.array(samples_auc)[indices])
 		for idx in indices[::-1]:
 			if count > save_count: break
 			count += 1
 			strong_performers.append(candidate_inherited_samples[idx])
-		print(f"\tfound {len(strong_performers)} strong performers")
+
+		if logger is not None:
+			logger.log({"train/Num strong performers": len(strong_performers)})
 		
 	record = {
 		"Dataset": dataset_name,
@@ -487,11 +514,9 @@ if __name__ == "__main__":
 	
 	records = []
 	for dataset in splits.columns:
-		# for data_key in splits[dataset][:len(splits[dataset])//2]:
-		# for data_key in splits[dataset][len(splits[dataset])//2:]:
 		for data_key in splits[dataset]:
 			try:
-				if "abalone-17_vs_7-8-9-10" in data_key: continue
+				# if "abalone-17_vs_7-8-9-10" in data_key or "abalone19" in data_key: continue
 
 				record = execute(
 					data_key, 
@@ -503,11 +528,10 @@ if __name__ == "__main__":
 					data_mapper[data_key]['y_test'],
 				)
 				records.append(record)
-				pd.DataFrame.from_records(records).to_csv("long_run_2025-07-07-1obj.csv", index=False)
+				pd.DataFrame.from_records(records).to_csv("long_run_2025-07-08-IMPROV-PERSIST.csv", index=False)
 
 			except Exception as E:
 				print(E)
-				
-		# break
+		break
 				
 		
