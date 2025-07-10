@@ -1,6 +1,7 @@
 from sklearn.neighbors import KNeighborsClassifier
 from sklearn.metrics import roc_auc_score
 from scipy.stats import ranksums
+from pymoo.core.termination import Termination
 
 from pymoo.util.nds.non_dominated_sorting import NonDominatedSorting
 from pymoo.operators.mutation.bitflip import BitflipMutation
@@ -11,6 +12,8 @@ from pymoo.core.problem import Problem
 from pymoo.optimize import minimize
 
 from joblib import Parallel, delayed
+
+from collections import defaultdict
 
 from torch.utils.data import Dataset, DataLoader
 import torch.optim as optim
@@ -25,98 +28,128 @@ import pickle
 import os
 
 from imblearn.over_sampling import (
-    SMOTE,
-    ADASYN,
-    BorderlineSMOTE,
+	SMOTE,
+	ADASYN,
+	BorderlineSMOTE,
 )
 from imblearn.combine import (
-    SMOTETomek,
-    SMOTEENN
+	SMOTETomek,
+	SMOTEENN
 )
 import wandb
+
+do_stop = False
+class MyTermination(Termination):
+
+	def __init__(self, max_gen):
+		super().__init__()
+		self.max_gen = max_gen
+
+	def _do_continue(self, algorithm):
+		global do_stop
+		if not do_stop or algorithm.n_gen > self.max_gen:
+			return False
+		return True
+
+	def _do_terminate(self, algorithm):
+		return not self._do_continue(algorithm)
+
+	def _update(self, algorithm):
+		return algorithm.n_gen / self.max_gen
 
 
 class AUC_Filter(Problem):
 	n_neighbours = 5
 	log_every = 5
-	def __init__(self, X_train, y_train, X_val, y_val, x_test, y_test, logger=None):
-		
+	index = []
+	early_stopping = False
+	def __init__(self, X_train, y_train, X_val, y_val, x_test, y_test, inclusion_threshold, logger=None):
+
+		AUC_Filter.early_stopping = False
+
+		# save data which can be accessed without
+		# violating experiment
 		self.generation_number = 0
-
-		self.X_train = X_train
-		self.y_train = y_train
-		self.X_val = X_val
-		self.y_val = y_val
-		self.X_TEST = x_test
-		self.Y_TEST = y_test
-		self.logger = logger
-
-		self.training_data = X_train
+		self.X_train, self.y_train = X_train, y_train
+		self.X_val, self.y_val = X_val, y_val
 		self.n_instances = X_train.shape[0]
-		
-		super().__init__(
-			n_var=self.n_instances,
-			n_obj=1,
-			# n_obj=2,               
-			n_constr=0,            
-			xl=0,                  
-			xu=1,                  
-			type_var=np.bool_,     
-		)
+		self.logger = logger
+		self.high_performers = []
+		self.inclusion_threshold = inclusion_threshold
+		 
+		# save data with special tags to 
+		# avoid data leakage.
+		self.WARNING__X_TEST__XX = x_test
+		self.WARNING__Y_TEST__XX = y_test
+	
+		super().__init__(n_var=self.n_instances, n_obj=2, n_constr=0, xl=0, xu=1, type_var=np.bool_)
 
-	@classmethod 
-	def train(cls, instance, x1, y1, x2, y2):
+	def train(self, instance, x1, y1, x2, y2):
 		
-		if np.sum(instance) >= cls.n_neighbours:
-			model = KNeighborsClassifier(
-				n_neighbors=cls.n_neighbours
-			)
-			model.fit(
-				x1[instance], 
-				y1[instance]
-			)
+		values = {
+			"Number of samples": np.sum(instance),
+			"Inverse AUC": 1
+		}
 
+		if np.sum(instance) >= AUC_Filter.n_neighbours:
+			model = KNeighborsClassifier(n_neighbors=AUC_Filter.n_neighbours)
+			model.fit(x1[instance], y1[instance])
 			y_pred = model.predict(x2)
-			return 1 - roc_auc_score(y2, y_pred)
+			auc = roc_auc_score(y2, y_pred)
 
-		return 1
+			if auc > self.inclusion_threshold:
+				self.high_performers.append((x1[instance], y1[instance]))
+
+			values["Inverse AUC"] = 1 - auc
+
+		return values
 	
 	def _evaluate(self, x, out, *args, **kwargs):
 		
-		values = Parallel(n_jobs=-1)(delayed(AUC_Filter.train)(instance, self.X_train, self.y_train, self.X_val, self.y_val) for instance in x)
-		F = np.column_stack(values)
+		results = Parallel(n_jobs=-1)(delayed(self.train)(instance, self.X_train, self.y_train, self.X_val, self.y_val) for instance in x)
+		auc = [result["Inverse AUC"] for result in results]
+		num_samples = [result["Number of samples"] for result in results]
+	
+		out["F"] = np.column_stack([auc, num_samples])
+
 
 		self.generation_number += 1
-		max_validation_auc = -1
-		real_test_auc = -1
-		max_test_auc = -1
+
+		metrics = defaultdict(lambda:-1)
 		if self.logger is not None and self.generation_number % AUC_Filter.log_every == 0:
-			for idx in NonDominatedSorting().do(F, only_non_dominated_front=True):
+			for idx in NonDominatedSorting().do(out["F"], only_non_dominated_front=True):
 				instance = x[idx]
 
 				if np.sum(instance) >= AUC_Filter.n_neighbours:
 					model = KNeighborsClassifier(n_neighbors=AUC_Filter.n_neighbours)
 					model.fit(self.X_train[instance], self.y_train[instance])
 					y_pred = model.predict(self.X_val)
-					validation_auc = roc_auc_score(self.y_val, y_pred)
+					metrics["Validation AUC"] = roc_auc_score(self.y_val, y_pred)
 
-					y_pred = model.predict(self.X_TEST)
-					test_auc = roc_auc_score(self.Y_TEST, y_pred)
+					y_pred = model.predict(self.WARNING__X_TEST__XX)
+					metrics["Test AUC"] = roc_auc_score(self.WARNING__Y_TEST__XX, y_pred)
 				
-					if test_auc > max_test_auc:
-						max_test_auc = test_auc
+					if metrics["Test AUC"] > metrics["Best Test AUC for population"]:
+						metrics["Best Test AUC for population"] = metrics["Test AUC"]
 					
-					if validation_auc > max_validation_auc:
-						max_validation_auc = validation_auc
-						real_test_auc = test_auc
-
-			self.logger.log({
-				"validation/optimized_AUC": max_validation_auc,
-				"test/optimized_AUC": real_test_auc,
-				"test/ideal_AUC": max_test_auc,
+					if metrics["Validation AUC"] > metrics["Best Validation AUC for population"]:
+						metrics["Best Validation AUC for population"] = metrics["Validation AUC"]
+						metrics["Real test AUC for population"] = metrics["Test AUC"]
+			
+			AUC_Filter.index.append({
+				"Validation AUC": metrics['Validation AUC'],
+				"X": self.X_train[instance],
+				"Y": self.y_train[instance]
 			})
 
-		out["F"] = F
+			if round(metrics['Validation AUC'], 2) >= 0.98:
+				do_stop = True # Overfitting
+
+			self.logger.log({
+				"validation/optimized_AUC": metrics["Best Validation AUC for population"],
+				"test/optimized_AUC": metrics["Real test AUC for population"],
+				"test/ideal_AUC": metrics["Best Test AUC for population"],
+			})
 
 class ConditionalVAE(nn.Module):
 	def __init__(self, input_dim, label_dim, hidden_dim, latent_dim):
@@ -286,34 +319,23 @@ class DiverseInheritedSampling(Sampling):
 		return init_pops
 
 def execute(data_key, x_train, y_train, x_validation, y_validation, x_test, y_test):
+	
+	AUC_Filter.index = []
+	global do_stop
+	do_stop = False
+
 	segments = data_key.split('_')
 	dataset_name, split_num = '_'.join(segments[1:]), segments[0]
 
 	logger = None
-	logger = wandb.init(
-			project="GA Instance Selection Over Sampling", 
-			group="hybridSample",
-			tags=['2025-07-07-revised', dataset_name],		
-			name=data_key
-		)
+	logger = wandb.init(project="GA Instance Selection Over Sampling", group="hybridSample", tags=['2025-07-09-TEST1', dataset_name], name=data_key)
 
 	strong_performers = []
 	curr_x_train, curr_y_train = x_train, y_train
-
-	model = KNeighborsClassifier(n_neighbors=AUC_Filter.n_neighbours)
-	model.fit(x_train, y_train)
-	y_pred = model.predict(x_validation)
-	baseline_AUC = roc_auc_score(y_validation, y_pred)
-
-	max_validation_auc = -1
-	real_test_auc = -1
-	max_test_auc = -1
-	optimized_num_samples = -1
-	ideal_num_samles = -1
-
-	print(f"Inital AUC to beat {round(baseline_AUC, 4)}")
+	values = defaultdict(lambda:-1)
+	values['Sample Inclusion Threshold'] = 0.80
 	for loop_num in range(3):
-		print(f"{data_key} loop num {loop_num}")
+		print(f"Start loop {loop_num}")
 		################################################# 
 		# Generate the synthetic samples using only training data.
 		# While doing so, track the maxima AUC expected
@@ -347,46 +369,31 @@ def execute(data_key, x_train, y_train, x_validation, y_validation, x_test, y_te
 			combined_curr_x = np.concatenate((combined_curr_x, carry_over_x), axis=0)
 			combined_curr_y = np.concatenate((combined_curr_y, carry_over_y), axis=0)
 
+		print(f"\t- Shape of combined_cur_x: {combined_curr_x.shape}")
+
 		# Save the index where the previously saved 
 		# samples (real and synthetic) begin.
 		new_idx = len(combined_curr_x)
-
 		synthetic_features, synthetic_labels = None, None
-		for sampler in [SMOTE, ADASYN, BorderlineSMOTE, cVAE, SMOTETomek, SMOTEENN]:
+		for idx, sampler in enumerate([SMOTE, ADASYN, BorderlineSMOTE, cVAE, SMOTETomek, SMOTEENN]):
+		# for idx, sampler in enumerate([SMOTE, ADASYN, BorderlineSMOTE, SMOTETomek, SMOTEENN]):
 			sampler = sampler()
-
 			try:
 				oversample_x, oversample_y = sampler.fit_resample(combined_curr_x, combined_curr_y)
-				model = KNeighborsClassifier(n_neighbors=AUC_Filter.n_neighbours)
-				model.fit(oversample_x, oversample_y)
-				y_pred = model.predict(x_validation)
-				auc = roc_auc_score(y_validation, y_pred)
-
-				# If the synthetic set pushes the baseline AUC
-				# up, save the new baseline performance
-				# this ensures the filter will only save
-				# samples from instances who perform better than
-				# the baseline.
-				print(f"\t{round(auc, 4)}")
-				if  auc > baseline_AUC:
-					baseline_AUC = auc
-
 				if synthetic_features is not None:
 					synthetic_features = np.concatenate((synthetic_features, oversample_x[new_idx:]))
 					synthetic_labels = np.concatenate((synthetic_labels, oversample_y[new_idx:]))
 				else:
 					synthetic_features, synthetic_labels = oversample_x[new_idx:], oversample_y[new_idx:]
-
 			except Exception as e:
 				print(f"\tDidnt generate new samples because {e}")
-
-		print(f"\t AUC to beat {round(baseline_AUC, 4)}")
 
 		# Create the candidate training set, with the synthetic features minus the validation
 		# set that was used to create the samples.
 		candidate_x_train = np.concatenate((curr_x_train, synthetic_features))
 		candidate_y_train = np.concatenate((curr_y_train, synthetic_labels))
 
+		print(f"\t- Shape of candidate x_train: {candidate_x_train.shape}")
 		#################################################
 		# Execute optimization filtering.
 		# Given the synthetic samples of SMOTE, ADASYN, and BorderlineSMOTE
@@ -397,6 +404,7 @@ def execute(data_key, x_train, y_train, x_validation, y_validation, x_test, y_te
 			candidate_x_train, candidate_y_train, 
 			x_validation, y_validation,
 			x_test, y_test,
+			values['Sample Inclusion Threshold'],
 			logger
 		)
 		algorithm = NSGA2(
@@ -409,9 +417,14 @@ def execute(data_key, x_train, y_train, x_validation, y_validation, x_test, y_te
 		result = minimize(
 			problem, 
 			algorithm, 
-			('n_gen', 100), 
-			save_history=False
+			termination=MyTermination(100),
+			save_history=False,
 		)
+
+		if do_stop:
+			strong_performers = [AUC_Filter.index[-2]['X'], AUC_Filter.index[-2]['Y']]
+			print(f"\t! Early stopped because validation AUC of {AUC_Filter.index['AUC']} found...")
+			break
 
 		#################################################
 		# For each individual in the final population track
@@ -419,9 +432,8 @@ def execute(data_key, x_train, y_train, x_validation, y_validation, x_test, y_te
 		# AUC expected with any one of SMOTE, ADAYSN, etc.
 		#################################################
 		
-		samples_auc = []
-		candidate_inherited_samples = []
-		
+		samples_auc, candidate_inherited_samples = [], []
+
 		for indidivual in result.pop:
 			instance = indidivual.X
 			if np.sum(instance) >= AUC_Filter.n_neighbours:
@@ -433,45 +445,71 @@ def execute(data_key, x_train, y_train, x_validation, y_validation, x_test, y_te
 				
 				# If the current validation AUC beats the pre-optimization best
 				# save the sample for later
-				if validation_auc > baseline_AUC:
+				if validation_auc > values['Sample Inclusion Threshold']:
 					samples_auc.append(validation_auc)
 					candidate_inherited_samples.append((candidate_x_train[instance], candidate_y_train[instance]))
 
-				############################################
-				# For logging and final result calculation
-				############################################
-				y_pred = model.predict(x_test)
-				test_auc = roc_auc_score(y_test, y_pred)
-				if validation_auc > max_validation_auc:
-					max_validation_auc = validation_auc
-					real_test_auc = test_auc
-					optimized_num_samples = np.sum(instance)
-				if test_auc > max_test_auc:
-					max_test_auc = test_auc
-					ideal_num_samles = np.sum(instance)
-				############################################
-		
+			else:
+				print(f"Error")
+
+		for x, y in result.problem.high_performers:
+			model = KNeighborsClassifier(n_neighbors=AUC_Filter.n_neighbours)
+			model.fit(x, y)
+			y_pred = model.predict(x_validation)
+			validation_auc = roc_auc_score(y_validation, y_pred)
+			samples_auc.append(validation_auc)
+			candidate_inherited_samples.append((x,y))
 		# Save the best 20 instances
 		# which had performance better
 		# than the pre-optimization 
 		# set.
 		# strong_performers = []
-		count, save_count = 0, 20
+		count = 0
 		indices = np.argsort(samples_auc)
 		for idx in indices[::-1]:
-			if count > save_count: break
-			count += 1
-			strong_performers.append(candidate_inherited_samples[idx])
-		print(f"\tfound {len(strong_performers)} strong performers")
-		
+			if count <= 20: 
+				strong_performers.append(candidate_inherited_samples[idx])
+				count += 1
+			else:
+				break
+
+		if logger is not None:
+			logger.log({"train/Total Persistent Samples": len(strong_performers)})
+	
+		print(f"\t- number of strong performers: {len(strong_performers)}")
+
+	for x, y in strong_performers:
+	
+		model = KNeighborsClassifier(n_neighbors=AUC_Filter.n_neighbours)
+		model.fit(x, y)
+		y_pred = model.predict(x_validation)
+		validation_auc = roc_auc_score(y_validation, y_pred)
+		y_pred = model.predict(x_test)
+		test_auc = roc_auc_score(y_test, y_pred)
+
+		if validation_auc > values["Best Validation AUC"]:
+			values["Best Validation AUC"] = validation_auc
+			values["Optimized Test AUC"] = test_auc
+			values["Best Validation Number of Samples"] = np.sum(instance)
+
+		if test_auc > values["Best Test AUC"]:
+			values["Best Test AUC"] = test_auc
+			values["Best Test Number of Samples"] = np.sum(instance)
+
+	if logger is not None:
+		logger.log({
+				"validation/optimized_AUC": values["Best Validation AUC"],
+				"test/optimized_AUC": values["Optimized Test AUC"],
+				"test/ideal_AUC": values["Best Test AUC"],
+			})	
 	record = {
 		"Dataset": dataset_name,
 		"Split Num": split_num,
-		"Optimized validation AUC": max_validation_auc,
-		"Optimized test AUC": real_test_auc,
-		"Ideal test AUC": max_test_auc,
-		"Optimized num samples": optimized_num_samples,
-		"Ideal num samples": ideal_num_samles
+		"Optimized validation AUC": values["Best Validation AUC"],
+		"Optimized test AUC": values["Optimized Test AUC"],
+		"Ideal test AUC": values["Best Test AUC"],
+		"Optimized num samples": values["Best Validation Number of Samples"],
+		"Ideal num samples": values["Best Test Number of Samples"]
 	}
 
 
@@ -487,11 +525,9 @@ if __name__ == "__main__":
 	
 	records = []
 	for dataset in splits.columns:
-		# for data_key in splits[dataset][:len(splits[dataset])//2]:
-		# for data_key in splits[dataset][len(splits[dataset])//2:]:
 		for data_key in splits[dataset]:
 			try:
-				if "abalone-17_vs_7-8-9-10" in data_key: continue
+				# if "abalone-17_vs_7-8-9-10" in data_key or "abalone19" in data_key: continue
 
 				record = execute(
 					data_key, 
@@ -503,11 +539,7 @@ if __name__ == "__main__":
 					data_mapper[data_key]['y_test'],
 				)
 				records.append(record)
-				pd.DataFrame.from_records(records).to_csv("long_run_2025-07-07-1obj.csv", index=False)
+				pd.DataFrame.from_records(records).to_csv("long_run_2025-07-09.csv", index=False)
 
 			except Exception as E:
 				print(E)
-				
-		# break
-				
-		

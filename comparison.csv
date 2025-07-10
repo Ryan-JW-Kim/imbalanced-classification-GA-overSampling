@@ -1,6 +1,0 @@
-Competitor,Pval < 0.05,Comp min,Comp avg,Comp max,cVAE min,cVAE avg,cVAE max
-SMOTE,True,67.48%,78.21%,89.52%,72.34%,84.33%,93.25%
-ADASYN,True,67.66%,78.07%,89.52%,72.34%,84.33%,93.25%
-Borderline SMOTE,True,64.79%,76.49%,87.01%,72.34%,84.33%,93.25%
-SMOTE Tomek,True,64.09%,77.25%,89.52%,72.34%,84.33%,93.25%
-SMOTE EENN,False,67.13%,81.55%,95.70%,72.34%,84.33%,93.25%
