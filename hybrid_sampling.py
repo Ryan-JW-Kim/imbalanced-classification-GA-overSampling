@@ -14,6 +14,7 @@ from pymoo.optimize import minimize
 from joblib import Parallel, delayed
 
 from collections import defaultdict
+from joblib import parallel_backend
 
 from torch.utils.data import Dataset, DataLoader
 import torch.optim as optim
@@ -39,6 +40,7 @@ from imblearn.combine import (
 import wandb
 
 do_stop = False
+
 class MyTermination(Termination):
 
 	def __init__(self, max_gen):
@@ -56,100 +58,6 @@ class MyTermination(Termination):
 
 	def _update(self, algorithm):
 		return algorithm.n_gen / self.max_gen
-
-
-class AUC_Filter(Problem):
-	n_neighbours = 5
-	log_every = 5
-	index = []
-	early_stopping = False
-	def __init__(self, X_train, y_train, X_val, y_val, x_test, y_test, inclusion_threshold, logger=None):
-
-		AUC_Filter.early_stopping = False
-
-		# save data which can be accessed without
-		# violating experiment
-		self.generation_number = 0
-		self.X_train, self.y_train = X_train, y_train
-		self.X_val, self.y_val = X_val, y_val
-		self.n_instances = X_train.shape[0]
-		self.logger = logger
-		self.high_performers = []
-		self.inclusion_threshold = inclusion_threshold
-		 
-		# save data with special tags to 
-		# avoid data leakage.
-		self.WARNING__X_TEST__XX = x_test
-		self.WARNING__Y_TEST__XX = y_test
-	
-		super().__init__(n_var=self.n_instances, n_obj=2, n_constr=0, xl=0, xu=1, type_var=np.bool_)
-
-	def train(self, instance, x1, y1, x2, y2):
-		
-		values = {
-			"Number of samples": np.sum(instance),
-			"Inverse AUC": 1
-		}
-
-		if np.sum(instance) >= AUC_Filter.n_neighbours:
-			model = KNeighborsClassifier(n_neighbors=AUC_Filter.n_neighbours)
-			model.fit(x1[instance], y1[instance])
-			y_pred = model.predict(x2)
-			auc = roc_auc_score(y2, y_pred)
-
-			if auc > self.inclusion_threshold:
-				self.high_performers.append((x1[instance], y1[instance]))
-
-			values["Inverse AUC"] = 1 - auc
-
-		return values
-	
-	def _evaluate(self, x, out, *args, **kwargs):
-		
-		results = Parallel(n_jobs=-1)(delayed(self.train)(instance, self.X_train, self.y_train, self.X_val, self.y_val) for instance in x)
-		auc = [result["Inverse AUC"] for result in results]
-		num_samples = [result["Number of samples"] for result in results]
-	
-		out["F"] = np.column_stack([auc, num_samples])
-
-
-		self.generation_number += 1
-
-		metrics = defaultdict(lambda:-1)
-		if self.logger is not None and self.generation_number % AUC_Filter.log_every == 0:
-			for idx in NonDominatedSorting().do(out["F"], only_non_dominated_front=True):
-				instance = x[idx]
-
-				if np.sum(instance) >= AUC_Filter.n_neighbours:
-					model = KNeighborsClassifier(n_neighbors=AUC_Filter.n_neighbours)
-					model.fit(self.X_train[instance], self.y_train[instance])
-					y_pred = model.predict(self.X_val)
-					metrics["Validation AUC"] = roc_auc_score(self.y_val, y_pred)
-
-					y_pred = model.predict(self.WARNING__X_TEST__XX)
-					metrics["Test AUC"] = roc_auc_score(self.WARNING__Y_TEST__XX, y_pred)
-				
-					if metrics["Test AUC"] > metrics["Best Test AUC for population"]:
-						metrics["Best Test AUC for population"] = metrics["Test AUC"]
-					
-					if metrics["Validation AUC"] > metrics["Best Validation AUC for population"]:
-						metrics["Best Validation AUC for population"] = metrics["Validation AUC"]
-						metrics["Real test AUC for population"] = metrics["Test AUC"]
-			
-			AUC_Filter.index.append({
-				"Validation AUC": metrics['Validation AUC'],
-				"X": self.X_train[instance],
-				"Y": self.y_train[instance]
-			})
-
-			if round(metrics['Validation AUC'], 2) >= 0.98:
-				do_stop = True # Overfitting
-
-			self.logger.log({
-				"validation/optimized_AUC": metrics["Best Validation AUC for population"],
-				"test/optimized_AUC": metrics["Real test AUC for population"],
-				"test/ideal_AUC": metrics["Best Test AUC for population"],
-			})
 
 class ConditionalVAE(nn.Module):
 	def __init__(self, input_dim, label_dim, hidden_dim, latent_dim):
@@ -286,19 +194,36 @@ class DiverseInheritedSampling(Sampling):
 	def __init__(self, curr_x_train, prev_samples):
 		super().__init__()
 		self.inherited_pops = []
+		row_to_idx = {row.tobytes(): i for i, row in enumerate(curr_x_train)}
+		n_train   = len(curr_x_train)
 
-		for x, y in prev_samples:
-			individual = np.zeros(len(curr_x_train))
-			for feature in x:
+		# for x, y in prev_samples:
+		# 	individual = np.zeros(len(curr_x_train))
+		# 	for feature in x:
 
-				idx = None
-				for idx, positioned_feature in enumerate(curr_x_train):
-					if np.all(positioned_feature == feature):
-						break
-				else:
-					individual[idx] = 1
+		# 		idx = None
+		# 		for idx, positioned_feature in enumerate(curr_x_train):
+		# 			if np.all(positioned_feature == feature):
+		# 				break
+		# 		else:
+		# 			individual[idx] = 1
 				
+		# 	self.inherited_pops.append(individual)
+
+		self.inherited_pops = []
+
+		for x_block, _ in prev_samples:
+			individual = np.zeros(n_train, dtype=np.uint8)
+
+			for feat in x_block:
+				h = feat.tobytes()
+				idx = row_to_idx.get(h)
+				individual[idx] = 1
+
+
 			self.inherited_pops.append(individual)
+
+		print(f"\t> Done calculating inherited population")
 
 	def _do(self, problem, n_samples, **kwargs):
 
@@ -316,25 +241,27 @@ class DiverseInheritedSampling(Sampling):
 		init_pops.extend(self.inherited_pops)
 		init_pops = np.array(init_pops, dtype=np.bool)
 	
+		print(f"\t>> Population initialized")
+
 		return init_pops
 
 def execute(data_key, x_train, y_train, x_validation, y_validation, x_test, y_test):
 	
-	AUC_Filter.index = []
-	global do_stop
+	global do_stop, instance_index
 	do_stop = False
+	instance_index = []
 
 	segments = data_key.split('_')
 	dataset_name, split_num = '_'.join(segments[1:]), segments[0]
 
 	logger = None
-	logger = wandb.init(project="GA Instance Selection Over Sampling", group="hybridSample", tags=['2025-07-09-TEST1', dataset_name], name=data_key)
+	logger = wandb.init(project="GA Instance Selection Over Sampling", group="hybridSample", tags=['2025-07-11-1loop', dataset_name], name=data_key)
 
 	strong_performers = []
 	curr_x_train, curr_y_train = x_train, y_train
 	values = defaultdict(lambda:-1)
 	values['Sample Inclusion Threshold'] = 0.80
-	for loop_num in range(3):
+	for loop_num in range(1):
 		print(f"Start loop {loop_num}")
 		################################################# 
 		# Generate the synthetic samples using only training data.
@@ -342,21 +269,52 @@ def execute(data_key, x_train, y_train, x_validation, y_validation, x_test, y_te
 		# pre-optimization to filter which samples are
 		# to be inherited to the next iteration.
 		#################################################
-		carry_over_x, carry_over_y = [], []
-		for x, y in strong_performers:
-			for features, label in zip(x, y):
-				for saved_features in curr_x_train:
-					if np.all(features == saved_features): break
-				else:
-					for prior_feature in carry_over_x:
-						if np.all(features == prior_feature): break
-					else:
-						# If features is a synthetic sample which is not yet 
-						# saved, add it to the list of samples
-						# being carried over into the GA filter.
-						carry_over_x.append(features)
-						carry_over_y.append(label)
+
+		print(f"\t- Combining {len(strong_performers)} prior instances")
+		# carry_over_x, carry_over_y = [], []
+		# for x, y in strong_performers:
+		# 	print(f"> {x.shape}")
+		# 	for features, label in zip(x, y):
+		# 		print(f">> {len(features)} L:{label}")
+		# 		for saved_features in curr_x_train:
+		# 			if np.all(features == saved_features): break
+		# 		else:
+		# 			for prior_feature in carry_over_x:
+		# 				if np.all(features == prior_feature): break
+		# 			else:
+		# 				# If features is a synthetic sample which is not yet 
+		# 				# saved, add it to the list of samples
+		# 				# being carried over into the GA filter.
+		# 				print(f'<< ADDED')
+		# 				carry_over_x.append(features)
+		# 				carry_over_y.append(label)
 		
+		###############################################################################
+		###############################################################################
+		###############################################################################
+		known_hashes = {row.tobytes() for row in curr_x_train}
+
+		carry_over_x, carry_over_y = [], []
+		seen_hashes = set()              # avoid duplicates within carry-over
+
+		# --- fast pass over strong_performers ---------------------------------------
+		for x_block, y_block in strong_performers:          # x_block.shape = (m, n_features)
+			for features, label in zip(x_block, y_block):
+				h = features.tobytes()
+
+				# skip if we already have it anywhere
+				if h in known_hashes or h in seen_hashes:
+					continue
+
+				# keep the new sample
+				carry_over_x.append(features)
+				carry_over_y.append(label)
+				seen_hashes.add(h)
+		###############################################################################
+		###############################################################################
+		###############################################################################
+
+		print(f"\t- Shape of carry over {len(carry_over_x)}")
 		# If there was something to carry over
 		# concatenate it to the real training set 
 		combined_curr_x = np.concatenate((curr_x_train, x_validation), axis=0)
@@ -417,13 +375,20 @@ def execute(data_key, x_train, y_train, x_validation, y_validation, x_test, y_te
 		result = minimize(
 			problem, 
 			algorithm, 
-			termination=MyTermination(100),
+			('n_gen', 25),
+			# termination=MyTermination(max_gen=25),
 			save_history=False,
 		)
 
 		if do_stop:
-			strong_performers = [AUC_Filter.index[-2]['X'], AUC_Filter.index[-2]['Y']]
-			print(f"\t! Early stopped because validation AUC of {AUC_Filter.index['AUC']} found...")
+
+			for rewind_generation in [-3, -2, -1]:
+				try:
+					strong_performers = [(instance_index[rewind_generation]['X'], instance_index[rewind_generation]['Y'])]
+					break
+				except:
+					continue
+			print(f"\t! Early stopped because validation AUC of {instance_index[-1]['Validation AUC']} found...")
 			break
 
 		#################################################
@@ -443,14 +408,9 @@ def execute(data_key, x_train, y_train, x_validation, y_validation, x_test, y_te
 				y_pred = model.predict(x_validation)
 				validation_auc = roc_auc_score(y_validation, y_pred)
 				
-				# If the current validation AUC beats the pre-optimization best
-				# save the sample for later
 				if validation_auc > values['Sample Inclusion Threshold']:
 					samples_auc.append(validation_auc)
 					candidate_inherited_samples.append((candidate_x_train[instance], candidate_y_train[instance]))
-
-			else:
-				print(f"Error")
 
 		for x, y in result.problem.high_performers:
 			model = KNeighborsClassifier(n_neighbors=AUC_Filter.n_neighbours)
@@ -490,11 +450,11 @@ def execute(data_key, x_train, y_train, x_validation, y_validation, x_test, y_te
 		if validation_auc > values["Best Validation AUC"]:
 			values["Best Validation AUC"] = validation_auc
 			values["Optimized Test AUC"] = test_auc
-			values["Best Validation Number of Samples"] = np.sum(instance)
+			values["Best Validation Number of Samples"] = -1 #np.sum(instance)
 
 		if test_auc > values["Best Test AUC"]:
 			values["Best Test AUC"] = test_auc
-			values["Best Test Number of Samples"] = np.sum(instance)
+			values["Best Test Number of Samples"] = -1 # np.sum(instance)
 
 	if logger is not None:
 		logger.log({
@@ -517,7 +477,49 @@ def execute(data_key, x_train, y_train, x_validation, y_validation, x_test, y_te
 		logger.finish()
 
 	return record
+
 if __name__ == "__main__":
+
+# 	import numpy as np, time
+# 	from joblib import Parallel, delayed
+# 	from random import randint
+
+# 	with open('data.pickle', 'rb') as fh:
+# 		data_mapper = pickle.load(fh)
+# 	splits = pd.read_csv('data_splits.csv')
+	
+# 	records = []
+# 	for dataset in splits.columns:
+# 		for data_key in splits[dataset]:
+
+# 			def timer(batch_size, n_trials=10):
+# 				prob = AUC_Filter(				
+# 						data_mapper[data_key]['x_train'],
+# 						data_mapper[data_key]['y_train'],
+# 						data_mapper[data_key]['x_validation'],
+# 						data_mapper[data_key]['y_validation'],
+# 						data_mapper[data_key]['x_test'],
+# 						data_mapper[data_key]['y_test'],
+# 						0
+# 					)
+# 				masks = [np.random.randint(0, 2, size=prob.n_var, dtype=bool) 
+# 						for _ in range(batch_size * n_trials)]
+# 				t0 = time.perf_counter()
+# 				Parallel(n_jobs=-1, batch_size=batch_size, mmap_mode='r')(
+# 					delayed(prob.train)(m, prob.X_train, prob.y_train,
+# 										prob.X_val, prob.y_val)
+# 					for m in masks)
+# 				return (time.perf_counter() - t0) / n_trials     # sec / batch
+			
+
+# 			for bs in (1, 4, 8, 16, 32, 64, 128, 236, 236*2 ):
+# 				print(f"batch {bs:>3}: {timer(bs):.3f} s")
+
+# 			break
+# 		break		
+	
+
+# if False:	
 
 	with open('data.pickle', 'rb') as fh:
 		data_mapper = pickle.load(fh)
@@ -526,20 +528,20 @@ if __name__ == "__main__":
 	records = []
 	for dataset in splits.columns:
 		for data_key in splits[dataset]:
-			try:
-				# if "abalone-17_vs_7-8-9-10" in data_key or "abalone19" in data_key: continue
+			# try:
+			if "abalone-17_vs_7-8-9-10" in data_key or "abalone-20_vs_8-9-10" in data_key or "abalone-21_vs_8" in data_key: continue
 
-				record = execute(
-					data_key, 
-					data_mapper[data_key]['x_train'],
-					data_mapper[data_key]['y_train'],
-					data_mapper[data_key]['x_validation'],
-					data_mapper[data_key]['y_validation'],
-					data_mapper[data_key]['x_test'],
-					data_mapper[data_key]['y_test'],
-				)
-				records.append(record)
-				pd.DataFrame.from_records(records).to_csv("long_run_2025-07-09.csv", index=False)
+			record = execute(
+				data_key, 
+				data_mapper[data_key]['x_train'],
+				data_mapper[data_key]['y_train'],
+				data_mapper[data_key]['x_validation'],
+				data_mapper[data_key]['y_validation'],
+				data_mapper[data_key]['x_test'],
+				data_mapper[data_key]['y_test'],
+			)
+			records.append(record)
+			pd.DataFrame.from_records(records).to_csv("long_run_2025-07-11-EXTEND.csv", index=False)
 
-			except Exception as E:
-				print(E)
+			# except Exception as E:
+			# 	print(E)
