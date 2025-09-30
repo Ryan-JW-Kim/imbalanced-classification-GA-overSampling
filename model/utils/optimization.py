@@ -31,16 +31,21 @@ class NSGA_II_Filter(Problem):
 		self.y_train = np.ascontiguousarray(y_train)
 		self.X_val, self.y_val = X_val, y_val
 		self.n_instances = X_train.shape[0]
-		super().__init__(n_var=self.n_instances, n_obj=2, n_constr=0, xl=0, xu=1, type_var=np.bool_)
+		super().__init__(n_var=self.n_instances, n_obj=3, n_constr=0, xl=0, xu=1, type_var=np.bool_)
 
 	def train(self, instance, x1, y1, x2, y2):
 		
-		values = {"Inverse ACC": 1, "Inverse AUC": 1}
+		values = {
+			"Inverse ACC": 1, 
+			"Inverse AUC": 1, 
+			"Sample Size": 1
+		}
 
 		if np.sum(instance) >= NSGA_II_Filter.n_neighbours:
 			model = KNeighborsClassifier(n_neighbors=NSGA_II_Filter.n_neighbours)
 			model.fit(x1[instance], y1[instance])
 			y_pred = model.predict(x2)
+			values["Sample Size"] = x1[instance].shape[0] / self.X_train.shape[0]
 			values["Inverse AUC"] = 1 - roc_auc_score(y2, y_pred)
 			values["Inverse ACC"] = 1 - accuracy_score(y2, y_pred)
 
